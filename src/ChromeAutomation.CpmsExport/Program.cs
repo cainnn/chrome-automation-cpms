@@ -115,8 +115,11 @@ static async Task RunDownloadOnlyAsync(string downloadListUrl, string? presetSer
         await WaitForExtensionAsync(chrome);
 
         var workTabId = await GetOrNavigateTabAsync(chrome, downloadListUrl, "[下载模式]");
-        await ChromeAutomationHelpers.DelayAsync(5000);
-        await chrome.WaitForTextAsync("后台下载状态", timeoutMs: 90000, tabId: workTabId);
+        workTabId = await CpmsWorkflow.EnsureDownloadListPageAsync(
+            chrome,
+            downloadListUrl,
+            workTabId,
+            msg => Console.WriteLine(msg));
 
         var serialNumber = presetSerial ?? await CpmsWorkflow.GetLatestSerialAsync(chrome, workTabId);
         Console.WriteLine($"[下载模式] 流水号: {serialNumber ?? "(列表首条)"}");
@@ -124,9 +127,13 @@ static async Task RunDownloadOnlyAsync(string downloadListUrl, string? presetSer
         if (!string.IsNullOrEmpty(serialNumber))
         {
             var status = await CpmsWorkflow.GetExportRowStatusAsync(chrome, serialNumber, workTabId);
-            if (status is { Success: false, Processing: true })
+            if (status is not { Success: true })
             {
                 await CpmsWorkflow.WaitForBackendReadyAsync(chrome, serialNumber, workTabId);
+            }
+            else
+            {
+                Console.WriteLine("[下载模式] 后台已处理完成，直接下载");
             }
         }
 
@@ -164,38 +171,48 @@ static async Task RunAsync(string reportUrl, string downloadListUrl)
         await WaitForExtensionAsync(chrome);
         Console.WriteLine("[1/7] Chrome 扩展已就绪");
 
-        Console.WriteLine($"[2/7] 打开报表页: {reportUrl}");
-        var workTabId = await GetOrNavigateTabAsync(chrome, reportUrl, "[2/7]");
-        await ChromeAutomationHelpers.DelayAsync(10000);
-
-        if (!await CpmsWorkflow.WaitForReportPageAsync(chrome, workTabId))
+        Console.WriteLine($"[2/7] 定位报表页: {reportUrl}");
+        var workTabId = await CpmsWorkflow.EnsureReportPageAsync(chrome, reportUrl, Console.WriteLine);
+        if (!workTabId.HasValue)
         {
-            await LogPageDebugAsync(chrome, workTabId, "report-page");
+            await LogPageDebugAsync(chrome, null, "report-page");
             throw new InvalidOperationException("无法加载项目明细查询报表页，请确认 Chrome 已登录 CPMS 内网");
         }
 
-        Console.WriteLine("[3/7] 点击「导出」");
-        await ChromeAutomationHelpers.DelayAsync(2000);
+        Console.WriteLine("[3/7] 点击「导出」并确认弹窗");
+        string? serialNumber;
         try
         {
-            await CpmsWorkflow.ClickExportButtonAsync(chrome, workTabId);
+            serialNumber = await CpmsWorkflow.ClickExportAndConfirmAsync(
+                chrome,
+                reportUrl,
+                workTabId,
+                Console.WriteLine);
         }
         catch (Exception ex)
         {
             await LogPageDebugAsync(chrome, workTabId, "export-failed");
-            throw new InvalidOperationException($"点击导出失败: {ex.Message}", ex);
+            throw new InvalidOperationException($"导出失败: {ex.Message}", ex);
         }
 
-        Console.WriteLine("[3/7] 等待导出提示弹窗并点击「确定」");
-        var serialNumber = await CpmsWorkflow.WaitAndConfirmExportDialogAsync(chrome, workTabId);
         Console.WriteLine(serialNumber is not null
             ? $"[3/7] 导出流水号: {serialNumber}"
             : "[3/7] 未从弹窗解析流水号，将在下载列表页获取");
 
         Console.WriteLine($"[4/7] 打开附件下载列表: {downloadListUrl}");
-        await chrome.NavigateAsync(downloadListUrl, waitUntil: null, tabId: workTabId);
-        await ChromeAutomationHelpers.DelayAsync(10000);
-        await chrome.WaitForTextAsync("后台下载状态", timeoutMs: 90000, tabId: workTabId);
+        try
+        {
+            workTabId = await CpmsWorkflow.EnsureDownloadListPageAsync(
+                chrome,
+                downloadListUrl,
+                workTabId,
+                Console.WriteLine) ?? workTabId;
+        }
+        catch (TimeoutException)
+        {
+            await LogPageDebugAsync(chrome, workTabId, "download-list");
+            throw;
+        }
 
         if (string.IsNullOrEmpty(serialNumber))
         {
@@ -241,6 +258,12 @@ static async Task LogPageDebugAsync(ChromeController chrome, int? tabId, string 
         if (buttons?.TryGetProperty("buttons", out var arr) == true)
         {
             Console.WriteLine($"[调试] 页面按钮文字: {string.Join(" | ", arr.EnumerateArray().Select(e => e.GetString()))}");
+        }
+
+        var exportBtn = await chrome.CommandAsync("cpmsHasExportButton", new { tabId });
+        if (exportBtn?.TryGetProperty("found", out var found) == true)
+        {
+            Console.WriteLine($"[调试] 导出按钮: found={found.GetBoolean()}, url={exportBtn?.GetProperty("url")}");
         }
 
         var info = await chrome.CommandAsync("getPageInfo", new { tabId });

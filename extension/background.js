@@ -125,6 +125,8 @@ async function executeAction(action, params) {
     case 'waitFor':
     case 'waitForText':
     case 'getBodyText':
+    case 'cpmsHasExportButton':
+    case 'cpmsRefreshDownloadList':
     case 'cpmsClickExport':
     case 'cpmsClickDialogConfirm':
     case 'cpmsGetLatestSerial':
@@ -214,9 +216,31 @@ async function navigate(params) {
     await waitForTabLoad(tabId, params.timeout || 30000);
   }
 
-  // SPA hash 路由：给前端一点渲染时间
+  // SPA hash 路由：tabs.update 有时只改地址栏，需强制 location 切换并等待渲染
   if (params.waitUntil === 'spa') {
-    await new Promise((r) => setTimeout(r, params.delay || 3000));
+    try {
+      await waitForTabLoad(tabId, Math.min(params.timeout || 45000, 45000));
+    } catch {
+      // 部分 CPMS 页 load 事件不完整，继续尝试
+    }
+
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: 'MAIN',
+      func: (targetUrl) => {
+        const targetHash = targetUrl.includes('#') ? targetUrl.slice(targetUrl.indexOf('#')) : '';
+        const currentHash = window.location.hash || '';
+        const sameRoute =
+          window.location.href === targetUrl ||
+          (targetHash && currentHash === targetHash);
+        if (!sameRoute) {
+          window.location.assign(targetUrl);
+        }
+      },
+      args: [url],
+    });
+
+    await new Promise((r) => setTimeout(r, params.delay || 5000));
   }
 
   const tab = await chrome.tabs.get(tabId);
@@ -308,6 +332,26 @@ async function contentAction(action, params) {
     return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
   }
 
+  function isLikelyDownloadUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    const lower = url.toLowerCase();
+    if (/operationlog|operation\/log|\/add(?:\?|$)/i.test(lower)) return false;
+    if (/\.(zip|xlsx|xls)(\?|$)/i.test(lower)) return true;
+    if (/\/download|\/export|attachment|filedownload|annex|getfile|downloadfile|file\/get/i.test(lower)) {
+      return true;
+    }
+    return false;
+  }
+
+  function pickBestDownloadUrl(urls) {
+    if (!Array.isArray(urls)) return null;
+    return (
+      urls.find((u) => u && /\.(zip|xlsx|xls)(\?|$)/i.test(u)) ||
+      urls.find((u) => u && isLikelyDownloadUrl(u)) ||
+      null
+    );
+  }
+
   function findExportButton() {
     const candidates = collectClickables(document);
     let exportBtn = candidates.find((el) => normalizeText(el) === '导出' && isVisible(el));
@@ -316,6 +360,10 @@ async function contentAction(action, params) {
         const text = normalizeText(el);
         return text.includes('导出') && text.length <= 8 && isVisible(el);
       });
+    }
+    if (!exportBtn) {
+      const buttons = document.querySelectorAll('.el-button, button, [role="button"]');
+      exportBtn = [...buttons].find((el) => normalizeText(el) === '导出' && isVisible(el));
     }
     if (!exportBtn) {
       exportBtn =
@@ -462,6 +510,37 @@ async function contentAction(action, params) {
       }
       case 'getBodyText':
         return { data: { text: document.body?.innerText ?? '' } };
+      case 'cpmsRefreshDownloadList': {
+        const labels = ['查询', '搜索', '刷新'];
+        for (const label of labels) {
+          const btn = findByText(label, true);
+          if (btn && isVisible(btn)) {
+            clickElement(btn.closest('button, .el-button, [role="button"]') || btn);
+            await new Promise((r) => setTimeout(r, 2500));
+            break;
+          }
+        }
+        const text = document.body?.innerText ?? '';
+        return {
+          data: {
+            url: location.href,
+            hasTable:
+              text.includes('后台下载状态') ||
+              text.includes('业务流水号') ||
+              text.includes('附件下载'),
+          },
+        };
+      }
+      case 'cpmsHasExportButton': {
+        const exportBtn = findExportButton();
+        return {
+          data: {
+            found: !!exportBtn,
+            text: exportBtn ? normalizeText(exportBtn) : null,
+            url: location.href,
+          },
+        };
+      }
       case 'cpmsClickExport': {
         const exportBtn = findExportButton();
         if (!exportBtn) return { error: 'export-button-not-found' };
@@ -471,27 +550,48 @@ async function contentAction(action, params) {
         return { data: { ok: true, text: normalizeText(clickTarget) } };
       }
       case 'cpmsClickDialogConfirm': {
+        const okLabels = ['确定', '确认', 'OK', '知道了'];
+        const matchOk = (el) => {
+          const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          return okLabels.some((label) => text === label || text.endsWith(label));
+        };
+
         const dialogs = [
-          ...document.querySelectorAll('.el-dialog, .el-message-box, [role="dialog"]'),
+          ...document.querySelectorAll('.el-dialog, .el-message-box, .el-overlay-message-box, [role="dialog"]'),
         ];
         for (const dlg of dialogs) {
           const style = window.getComputedStyle(dlg);
           if (style.display === 'none' || style.visibility === 'hidden') continue;
-          const btns = dlg.querySelectorAll('button, .el-button, span');
-          const okBtn = [...btns].find((b) => (b.innerText || b.textContent || '').trim() === '确定');
+          const btns = dlg.querySelectorAll(
+            'button, .el-button, .el-message-box__btns button, .el-dialog__footer button, span',
+          );
+          const okBtn = [...btns].find(matchOk);
           if (okBtn) {
-            okBtn.click();
+            (okBtn.closest('button, .el-button, [role="button"]') || okBtn).click();
             return { data: { ok: true, source: 'dialog' } };
           }
         }
+
+        const overlays = [...document.querySelectorAll('.el-message-box__wrapper, .v-modal')].filter((el) => {
+          const style = window.getComputedStyle(el);
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        });
+        for (const overlay of overlays) {
+          const btns = overlay.querySelectorAll('button, .el-button');
+          const okBtn = [...btns].find(matchOk);
+          if (okBtn) {
+            okBtn.click();
+            return { data: { ok: true, source: 'overlay' } };
+          }
+        }
+
         const globalOk = [...document.querySelectorAll('button, .el-button, span, a')].filter((el) => {
-          const text = (el.innerText || el.textContent || '').trim();
-          if (text !== '确定') return false;
+          if (!matchOk(el)) return false;
           const rect = el.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0;
         });
         if (globalOk.length > 0) {
-          globalOk[globalOk.length - 1].click();
+          (globalOk[globalOk.length - 1].closest('button, .el-button, [role="button"]') || globalOk[globalOk.length - 1]).click();
           return { data: { ok: true, source: 'global' } };
         }
         return { error: 'confirm-button-not-found' };
@@ -526,8 +626,31 @@ async function contentAction(action, params) {
         const row = rows.find((r) => (r.innerText || '').includes(serial));
         if (!row) return { error: '未找到流水号所在行: ' + serial };
         const links = [...row.querySelectorAll('a[href]')];
-        const direct = links.find((a) => a.href && !a.href.startsWith('javascript:'));
+        const direct = links.find((a) => a.href && !a.href.startsWith('javascript:') && isLikelyDownloadUrl(a.href));
         if (direct) return { data: { url: direct.href } };
+
+        const html = row.innerHTML || '';
+        const apiMatch = html.match(/['"]([^'"]*(?:download|export|attachment|annex|fileDownload)[^'"]*)['"]/i);
+        if (apiMatch?.[1]) {
+          return { data: { url: apiMatch[1] } };
+        }
+
+        const clickables = [...row.querySelectorAll('a, button, .el-link, .el-button, span')];
+        const downloadEl = clickables.find((el) => {
+          const text = normalizeText(el);
+          return text === '下载' || text.includes('下载');
+        });
+        if (downloadEl) {
+          for (const attr of ['data-url', 'data-href', 'data-path', 'href']) {
+            const value =
+              downloadEl.getAttribute?.(attr) ||
+              downloadEl.closest('a, .el-link, .el-button')?.getAttribute?.(attr);
+            if (value && !value.startsWith('javascript:') && isLikelyDownloadUrl(value)) {
+              return { data: { url: value } };
+            }
+          }
+        }
+
         return { data: { url: null } };
       }
       case 'cpmsClickDownload': {
@@ -564,9 +687,12 @@ async function contentAction(action, params) {
         const origFetch = window.fetch;
         window.fetch = function (...args) {
           const reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-          if (reqUrl) capturedUrls.push(reqUrl);
+          if (reqUrl && isLikelyDownloadUrl(reqUrl)) capturedUrls.push(reqUrl);
           return origFetch.apply(this, args).then((res) => {
-            if (res?.url) capturedUrls.push(res.url);
+            const ct = res?.headers?.get?.('content-type') || '';
+            if (res?.url && (/zip|octet-stream|spreadsheet|excel|vnd\./i.test(ct) || isLikelyDownloadUrl(res.url))) {
+              capturedUrls.unshift(res.url);
+            }
             return res;
           });
         };
@@ -576,7 +702,7 @@ async function contentAction(action, params) {
           const xhr = new OrigXHR();
           const origOpen = xhr.open;
           xhr.open = function (method, url, ...rest) {
-            if (url) capturedUrls.push(String(url));
+            if (url && isLikelyDownloadUrl(String(url))) capturedUrls.push(String(url));
             return origOpen.call(xhr, method, url, ...rest);
           };
           return xhr;
@@ -585,33 +711,19 @@ async function contentAction(action, params) {
         window.XMLHttpRequest = HookedXHR;
 
         clickElement(target);
-        await new Promise((r) => setTimeout(r, 3500));
+        await new Promise((r) => setTimeout(r, 6000));
         window.open = origOpen;
         window.fetch = origFetch;
         window.XMLHttpRequest = OrigXHR;
 
-        const downloadUrl =
-          capturedUrls.find((u) => u && /\.(zip|xlsx|xls)(\?|$)/i.test(u)) ||
-          capturedUrls.find(
-            (u) =>
-              u &&
-              (/\/download/i.test(u) ||
-                /\/export/i.test(u) ||
-                /attachment/i.test(u) ||
-                /fileDownload/i.test(u) ||
-                /annex/i.test(u)),
-          ) ||
-          capturedUrls.find((u) => u && u.startsWith('http'));
+        const downloadUrl = pickBestDownloadUrl(capturedUrls);
         if (downloadUrl) {
-          return { data: { ok: true, url: downloadUrl, method: 'network' } };
+          return { data: { ok: true, url: downloadUrl, method: 'network', captured: capturedUrls.slice(0, 8) } };
         }
-        if (capturedUrls.length > 0) {
-          return { data: { ok: true, url: capturedUrls[capturedUrls.length - 1], method: 'captured' } };
-        }
-        if (target.href && !target.href.startsWith('javascript:')) {
+        if (target.href && !target.href.startsWith('javascript:') && isLikelyDownloadUrl(target.href)) {
           return { data: { ok: true, url: target.href, method: 'click' } };
         }
-        return { data: { ok: true, method: 'click-only' } };
+        return { data: { ok: true, method: 'click-only', captured: capturedUrls.slice(0, 8) } };
       }
       case 'cpmsFirstReadyRow': {
         const rows = [...document.querySelectorAll('tr, .el-table__row, .ant-table-row')];
@@ -800,6 +912,26 @@ function resolveAbsoluteUrl(url, baseUrl) {
   }
 }
 
+function isLikelyDownloadUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  const lower = url.toLowerCase();
+  if (/operationlog|operation\/log|\/add(?:\?|$)/i.test(lower)) return false;
+  if (/\.(zip|xlsx|xls)(\?|$)/i.test(lower)) return true;
+  if (/\/download|\/export|attachment|filedownload|annex|getfile|downloadfile|file\/get/i.test(lower)) {
+    return true;
+  }
+  return false;
+}
+
+function pickBestDownloadUrl(urls) {
+  if (!Array.isArray(urls)) return null;
+  return (
+    urls.find((u) => u && /\.(zip|xlsx|xls)(\?|$)/i.test(u)) ||
+    urls.find((u) => u && isLikelyDownloadUrl(u)) ||
+    null
+  );
+}
+
 function suggestFilename(url, response, serialNumber) {
   const disposition = response?.headers?.get?.('content-disposition') || '';
   const match = disposition.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
@@ -889,13 +1021,22 @@ async function cpmsDownloadBySerial(params) {
   await chrome.tabs.update(tabId, { active: true });
   enableAutoAcceptDownloads({ durationMs: 15 * 60 * 1000 });
 
-  const clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
-  const downloadUrl = resolveAbsoluteUrl(
-    clickResult?.url,
-    (await chrome.tabs.get(tabId)).url,
-  );
+  const tab = await chrome.tabs.get(tabId);
+  let downloadUrl = null;
 
-  if (downloadUrl) {
+  try {
+    const urlProbe = await runInTab('cpmsGetDownloadUrl', { ...params, tabId });
+    downloadUrl = resolveAbsoluteUrl(urlProbe?.url, tab.url || '');
+  } catch (err) {
+    console.warn('[AutomationBridge] cpmsGetDownloadUrl failed:', err);
+  }
+
+  const clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
+  if (!isLikelyDownloadUrl(downloadUrl)) {
+    downloadUrl = resolveAbsoluteUrl(pickBestDownloadUrl(clickResult?.captured) || clickResult?.url, tab.url || '');
+  }
+
+  if (isLikelyDownloadUrl(downloadUrl)) {
     try {
       return await downloadWithSessionCookies(
         downloadUrl,

@@ -103,8 +103,9 @@ public sealed class ChromeController : IAsyncDisposable
         string url,
         string? waitUntil = "load",
         int? tabId = null,
+        string? recreateUrl = null,
         CancellationToken cancellationToken = default) =>
-        CommandAsync("navigate", new { url, waitUntil, tabId }, cancellationToken);
+        CommandAsync("navigate", new { url, waitUntil, tabId, recreateUrl }, cancellationToken);
 
     public Task<JsonElement?> ClickAsync(
         string selector,
