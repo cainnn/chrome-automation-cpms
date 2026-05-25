@@ -1,0 +1,7 @@
+Windows Registry Editor Version 5.00
+
+; 关闭 Chrome「不安全下载」警告（需管理员导入后重启 Chrome）
+; 右键本文件 -> 合并，或以管理员运行 regedit 导入
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome]
+"InsecureDownloadWarningsEnabled"=dword:00000000

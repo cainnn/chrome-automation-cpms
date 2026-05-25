@@ -1,0 +1,72 @@
+body {
+  width: 280px;
+  margin: 0;
+  padding: 16px;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  color: #1a1a1a;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.status {
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+
+.status.connected {
+  background: #e6f4ea;
+  color: #137333;
+}
+
+.status.disconnected {
+  background: #fce8e6;
+  color: #c5221f;
+}
+
+label {
+  display: block;
+  margin-bottom: 12px;
+}
+
+input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  flex: 1;
+  padding: 8px;
+  border: none;
+  border-radius: 4px;
+  background: #1a73e8;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+button:hover {
+  background: #1557b0;
+}
+
+.hint {
+  margin: 12px 0 0;
+  color: #5f6368;
+  font-size: 11px;
+  line-height: 1.4;
+}

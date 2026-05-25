@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chrome Automation Bridge</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <h1>Automation Bridge</h1>
+  <div id="status" class="status disconnected">未连接</div>
+  <label>
+    WebSocket 地址
+    <input type="text" id="wsUrl" value="ws://127.0.0.1:9333" />
+  </label>
+  <div class="actions">
+    <button id="saveBtn">保存并重连</button>
+    <button id="reconnectBtn">重新连接</button>
+  </div>
+  <p class="hint">请先启动 bridge 服务器，再加载本扩展。</p>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Screenshots output
+output/
