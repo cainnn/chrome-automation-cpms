@@ -962,32 +962,60 @@ async function downloadWithSessionCookies(url, tabId, filename) {
 
   const tab = await chrome.tabs.get(tabId);
   const absoluteUrl = resolveAbsoluteUrl(url, tab.url || url);
-  const cookieUrl = new URL(absoluteUrl).origin + '/';
-  const cookies = await chrome.cookies.getAll({ url: cookieUrl });
-  const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 
-  const res = await fetch(absoluteUrl, {
-    method: 'GET',
-    headers: cookieHeader ? { Cookie: cookieHeader } : {},
-    credentials: 'include',
-  });
+  // fetch with credentials:'include' 会自动带 cookie；手动设置 Cookie header 会被
+  // 浏览器静默丢弃（forbidden header）。保留对原始 cookieHeader 的获取仅用于日志/诊断。
+  let res;
+  try {
+    res = await fetch(absoluteUrl, {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'follow',
+    });
+  } catch (err) {
+    throw new Error(`fetch threw on ${absoluteUrl}: ${err.message || err}`);
+  }
   if (!res.ok) {
-    throw new Error(`Download fetch failed: ${res.status} ${res.statusText}`);
+    throw new Error(`fetch HTTP ${res.status} ${res.statusText} on ${absoluteUrl}`);
   }
 
   const buf = await res.arrayBuffer();
-  const mime = res.headers.get('content-type') || 'application/zip';
+  const mime = (res.headers.get('content-type') || 'application/zip').toLowerCase();
+
+  // 校验：若返回的是 HTML/JSON，说明 URL 错了（通常是登录重定向或后端报错），
+  // 此时直接抛错而不是把垃圾 blob 落盘。
+  const looksLikeFile =
+    /zip|octet-stream|spreadsheet|excel|vnd\.openxml|application\/x-/i.test(mime) ||
+    buf.byteLength > 2048;
+  const looksLikeHtmlOrJson = /text\/html|application\/json|text\/plain/i.test(mime);
+  if (looksLikeHtmlOrJson && !looksLikeFile) {
+    const preview = new TextDecoder('utf-8', { fatal: false })
+      .decode(new Uint8Array(buf).slice(0, 300))
+      .replace(/\s+/g, ' ');
+    throw new Error(
+      `URL did not return a file (HTTP 200 but content-type=${mime}, ${buf.byteLength}B). Preview: ${preview}`,
+    );
+  }
+
   const blob = new Blob([buf], { type: mime });
   const blobUrl = URL.createObjectURL(blob);
   const saveAs = filename || suggestFilename(absoluteUrl, res);
 
   try {
-    const id = await chrome.downloads.download({
-      url: blobUrl,
-      filename: saveAs,
-      saveAs: false,
-      conflictAction: 'uniquify',
-    });
+    let id;
+    try {
+      id = await chrome.downloads.download({
+        url: blobUrl,
+        filename: saveAs,
+        saveAs: false,
+        conflictAction: 'uniquify',
+      });
+    } catch (err) {
+      throw new Error(
+        `chrome.downloads.download(blob:) failed: ${err.message || err}. ` +
+        `filename="${saveAs}", size=${buf.byteLength}, mime=${mime}`,
+      );
+    }
     trackExtensionDownload(id);
     return {
       id,
@@ -1015,6 +1043,7 @@ async function cpmsDownloadBySerial(params) {
   enableAutoAcceptDownloads({ durationMs: 15 * 60 * 1000 });
 
   const tab = await chrome.tabs.get(tabId);
+  const diag = [];
 
   // 首选路径：纯 DOM 探测拿到下载 URL，直接走 fetch+blob 旁路。
   // 不模拟点击 → 不触发浏览器原生下载 → Chrome 不会弹"不安全下载"提示。
@@ -1023,28 +1052,36 @@ async function cpmsDownloadBySerial(params) {
     const urlProbe = await runInTab('cpmsGetDownloadUrl', { ...params, tabId });
     probedUrl = resolveAbsoluteUrl(urlProbe?.url, tab.url || '');
   } catch (err) {
-    console.warn('[AutomationBridge] cpmsGetDownloadUrl failed:', err);
+    diag.push(`probe-threw: ${err.message || err}`);
   }
 
   if (isLikelyDownloadUrl(probedUrl)) {
     try {
-      return await downloadWithSessionCookies(
+      const ok = await downloadWithSessionCookies(
         probedUrl,
         tabId,
         suggestFilename(probedUrl, null, params.serialNumber),
       );
+      return { ...ok, diag: diag.length ? diag : undefined };
     } catch (err) {
-      console.warn('[AutomationBridge] blob bypass failed on probed URL:', err);
-      // 继续走 click 兜底（不再 fallback 到 chrome.downloads.download(url)，
-      // 因为那条路径就是会触发 Chrome 危险提示的元凶）。
+      diag.push(`blob-probed: ${err.message || err}`);
     }
+  } else {
+    diag.push(probedUrl ? `probe-url-not-download-like: ${probedUrl}` : 'probe-url-empty');
   }
 
   // 兜底路径：探测不到 URL 才点击。cpmsClickDownload 会 hook fetch/XHR/window.open，
   // 尽量在原生下载真正发起之前从网络层抓到 URL，然后再走一次 blob 旁路。
   // 若页面用 <a download> 或 location.href 触发下载，这一步可能仍会弹 Chrome 提示，
   // 这是 DOM 探测彻底失败时的最后退路。
-  const clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
+  let clickResult = null;
+  try {
+    clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
+  } catch (err) {
+    diag.push(`click-threw: ${err.message || err}`);
+    throw new Error(`cpmsDownloadBySerial 全部路径失败 | ${diag.join(' | ')}`);
+  }
+
   const clickedUrl = resolveAbsoluteUrl(
     pickBestDownloadUrl(clickResult?.captured) || clickResult?.url,
     tab.url || '',
@@ -1052,17 +1089,23 @@ async function cpmsDownloadBySerial(params) {
 
   if (isLikelyDownloadUrl(clickedUrl)) {
     try {
-      return await downloadWithSessionCookies(
+      const ok = await downloadWithSessionCookies(
         clickedUrl,
         tabId,
         clickResult?.filename || suggestFilename(clickedUrl, null, params.serialNumber),
       );
+      return { ...ok, diag };
     } catch (err) {
-      console.warn('[AutomationBridge] blob bypass failed on clicked URL:', err);
+      diag.push(`blob-clicked: ${err.message || err}`);
     }
+  } else {
+    const captured = (clickResult?.captured || []).slice(0, 5);
+    diag.push(`click-no-download-url (url=${clickedUrl || 'null'}, captured=${JSON.stringify(captured)})`);
   }
 
-  return { ...(clickResult || {}), method: clickResult?.method || 'click-only' };
+  // 走到这里说明探测、blob、点击+blob 全都没拿到文件。把所有诊断信息抛回去，
+  // 不要再静默返回 method:click-only —— 否则 C# 那边只能记一个无信息的 "failed"。
+  throw new Error(`cpmsDownloadBySerial 全部路径失败 | ${diag.join(' | ')}`);
 }
 
 function waitForDownload(params = {}) {
