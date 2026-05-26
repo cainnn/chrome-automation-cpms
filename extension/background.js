@@ -132,6 +132,8 @@ async function executeAction(action, params) {
     case 'cpmsGetLatestSerial':
     case 'cpmsExportRowStatus':
     case 'cpmsClickDownload':
+    case 'cpmsResolveDownloadUrl':
+    case 'cpmsSniffDownloadUrlOnClick':
     case 'cpmsGetDownloadUrl':
     case 'cpmsFirstReadyRow':
     case 'cpmsClickFirstReadyDownload':
@@ -268,8 +270,9 @@ function waitForTabLoad(tabId, timeout) {
 
 async function runInTab(action, params) {
   const tabId = await resolveTabId(params.tabId, params.recreateUrl);
+  const allFrames = action === 'getBodyText';
   const results = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
+    target: { tabId, allFrames },
     world: 'MAIN',
     func: contentAction,
     args: [action, params],
@@ -334,13 +337,38 @@ async function contentAction(action, params) {
 
   function isLikelyDownloadUrl(url) {
     if (!url || typeof url !== 'string') return false;
-    const lower = url.toLowerCase();
-    if (/operationlog|operation\/log|\/add(?:\?|$)/i.test(lower)) return false;
+    const lower = url.toLowerCase().replace(/:\//g, '/');
+    if (
+      /operationlog|operation\/log|\/add(?:\?|$)|getattachmentdownloadinfolist|infolist/i.test(
+        lower,
+      )
+    ) {
+      return false;
+    }
     if (/\.(zip|xlsx|xls)(\?|$)/i.test(lower)) return true;
-    if (/\/download|\/export|attachment|filedownload|annex|getfile|downloadfile|file\/get/i.test(lower)) {
+    if (
+      /downloadattachment|\/download|exportfile|filedownload|getfile|downloadfile|file\/get/i.test(
+        lower,
+      )
+    ) {
       return true;
     }
     return false;
+  }
+
+  function extractUrlsFromJson(value, out) {
+    if (!value) return;
+    if (typeof value === 'string') {
+      if (isLikelyDownloadUrl(value)) out.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((v) => extractUrlsFromJson(v, out));
+      return;
+    }
+    if (typeof value === 'object') {
+      Object.values(value).forEach((v) => extractUrlsFromJson(v, out));
+    }
   }
 
   function pickBestDownloadUrl(urls) {
@@ -620,6 +648,119 @@ async function contentAction(action, params) {
           },
         };
       }
+      case 'cpmsResolveDownloadUrl': {
+        const serial = params.serialNumber || '';
+        const urls = [];
+        const rows = [...document.querySelectorAll('tr, .el-table__row, .ant-table-row')];
+        const row = rows.find((r) => (r.innerText || '').includes(serial));
+        if (!row) return { error: '未找到流水号所在行: ' + serial };
+
+        const html = row.innerHTML || '';
+        const patterns = [
+          /['"]([^'"]*downloadAttachment[^'"]*)['"]/gi,
+          /['"]([^'"]*(?:download|export|attachment|annex|fileDownload)[^'"]*)['"]/gi,
+        ];
+        for (const re of patterns) {
+          let m;
+          while ((m = re.exec(html)) !== null) {
+            if (m[1] && isLikelyDownloadUrl(m[1])) urls.push(m[1]);
+          }
+        }
+
+        const links = [...row.querySelectorAll('a[href]')];
+        for (const a of links) {
+          if (a.href && isLikelyDownloadUrl(a.href)) urls.push(a.href);
+        }
+
+        const apiPaths = [
+          '/cpms/mops/mops/v1/getAttachmentDownloadInfoList',
+          '/pms/mops/mops/v1/getAttachmentDownloadInfoList',
+        ];
+        const bodies = [
+          { businessSerialNumber: serial },
+          { serialNumber: serial },
+          { businessFlowCode: serial },
+          { pageNum: 1, pageSize: 20, businessSerialNumber: serial },
+        ];
+        const origin = window.location.origin;
+        for (const path of apiPaths) {
+          for (const body of bodies) {
+            try {
+              const res = await fetch(origin + path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify(body),
+              });
+              if (!res.ok) continue;
+              const json = await res.json();
+              extractUrlsFromJson(json, urls);
+            } catch {
+              /* try next */
+            }
+          }
+        }
+
+        const best = pickBestDownloadUrl(urls);
+        return { data: { urls: [...new Set(urls)].slice(0, 20), best } };
+      }
+      case 'cpmsSniffDownloadUrlOnClick': {
+        const serial = params.serialNumber || '';
+        const rows = [...document.querySelectorAll('tr, .el-table__row, .ant-table-row')];
+        const row = rows.find((r) => (r.innerText || '').includes(serial));
+        if (!row) return { error: '未找到流水号所在行: ' + serial };
+        if (!(row.innerText || '').includes('后台下载成功')) {
+          return { error: '后台尚未处理完成' };
+        }
+        row.scrollIntoView({ block: 'center', behavior: 'instant' });
+        const clickables = [...row.querySelectorAll('button, a, span, .el-button, .el-link, [role="button"]')];
+        let download = clickables.find((el) => normalizeText(el) === '下载');
+        if (!download) {
+          download = clickables.find((el) => normalizeText(el).includes('下载'));
+        }
+        if (!download) return { error: '该行未找到下载按钮' };
+        const target = download.closest('button, a, .el-button, .el-link, [role="button"]') || download;
+
+        const capturedUrls = [];
+        const origFetch = window.fetch;
+        window.fetch = function (...args) {
+          const reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+          if (reqUrl && isLikelyDownloadUrl(reqUrl)) capturedUrls.push(reqUrl);
+          return origFetch.apply(this, args).then((res) => {
+            const ct = res?.headers?.get?.('content-type') || '';
+            if (res?.url && (/zip|octet-stream|spreadsheet|excel|vnd\./i.test(ct) || isLikelyDownloadUrl(res.url))) {
+              capturedUrls.unshift(res.url);
+            }
+            return res;
+          });
+        };
+        const OrigXHR = window.XMLHttpRequest;
+        function HookedXHR() {
+          const xhr = new OrigXHR();
+          const origOpen = xhr.open;
+          xhr.open = function (method, url, ...rest) {
+            if (url && isLikelyDownloadUrl(String(url))) capturedUrls.push(String(url));
+            return origOpen.call(xhr, method, url, ...rest);
+          };
+          return xhr;
+        }
+        HookedXHR.prototype = OrigXHR.prototype;
+        window.XMLHttpRequest = HookedXHR;
+
+        clickElement(target);
+        await new Promise((r) => setTimeout(r, 4000));
+        window.fetch = origFetch;
+        window.XMLHttpRequest = OrigXHR;
+
+        const url = pickBestDownloadUrl(capturedUrls);
+        return {
+          data: {
+            url,
+            captured: [...new Set(capturedUrls)].slice(0, 12),
+            method: url ? 'network-sniff' : 'sniff-no-url',
+          },
+        };
+      }
       case 'cpmsGetDownloadUrl': {
         const serial = params.serialNumber || '';
         const rows = [...document.querySelectorAll('tr, .el-table__row, .ant-table-row')];
@@ -663,12 +804,6 @@ async function contentAction(action, params) {
           return { error: '后台尚未处理完成' };
         }
         row.scrollIntoView({ block: 'center', behavior: 'instant' });
-        const links = [...row.querySelectorAll('a[href]')];
-        const direct = links.find((a) => a.href && !a.href.startsWith('javascript:'));
-        if (direct) {
-          return { data: { ok: true, url: direct.href, method: 'href' } };
-        }
-
         const clickables = [...row.querySelectorAll('button, a, span, .el-button, .el-link, [role="button"]')];
         let download = clickables.find((el) => normalizeText(el) === '下载');
         if (!download) {
@@ -678,12 +813,6 @@ async function contentAction(action, params) {
         const target = download.closest('button, a, .el-button, .el-link, [role="button"]') || download;
 
         const capturedUrls = [];
-        const origOpen = window.open;
-        window.open = function (url, ...rest) {
-          if (typeof url === 'string') capturedUrls.push(url);
-          return origOpen.call(window, url, ...rest);
-        };
-
         const origFetch = window.fetch;
         window.fetch = function (...args) {
           const reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
@@ -712,7 +841,6 @@ async function contentAction(action, params) {
 
         clickElement(target);
         await new Promise((r) => setTimeout(r, 6000));
-        window.open = origOpen;
         window.fetch = origFetch;
         window.XMLHttpRequest = OrigXHR;
 
@@ -811,27 +939,11 @@ function setupDownloadListeners() {
   if (setupDownloadListeners.initialized) return;
   setupDownloadListeners.initialized = true;
 
-  chrome.downloads.onCreated.addListener((item) => {
-    if (!shouldAutoAcceptDownload(item)) return;
-    if (item.danger) {
-      chrome.downloads.acceptDanger(item.id).catch(() => {});
-    }
-  });
+  // acceptDanger 在 MV3 service worker 中不可用，且语义是“再弹确认框”而非自动保留。
+  // 下载统一走 blob 旁路（blob: URL），不在此监听危险下载。
 
   chrome.downloads.onChanged.addListener(async (delta) => {
     if (!delta.id) return;
-
-    if (delta.danger && isAutoAcceptSessionActive()) {
-      const [item] = await chrome.downloads.search({ id: delta.id });
-      if (item && shouldAutoAcceptDownload(item)) {
-        try {
-          await chrome.downloads.acceptDanger(delta.id);
-          console.log('[AutomationBridge] Accepted dangerous download:', delta.id);
-        } catch (err) {
-          console.warn('[AutomationBridge] acceptDanger failed:', err);
-        }
-      }
-    }
 
     if (delta.state?.current === 'complete' || delta.state?.current === 'interrupted') {
       const [item] = await chrome.downloads.search({ id: delta.id });
@@ -875,27 +987,14 @@ function disableAutoAcceptDownloads() {
 }
 
 async function acceptPendingDownloads(params = {}) {
-  if (!isAutoAcceptSessionActive()) {
-    return { accepted: [], count: 0, skipped: 'session-inactive' };
-  }
-  setupDownloadListeners();
-  const accepted = [];
-  const items = await chrome.downloads.search({
-    orderBy: ['-startTime'],
-    limit: 20,
-  });
-
-  for (const item of items) {
-    if (!item.danger || !shouldAutoAcceptDownload(item)) continue;
-    try {
-      await chrome.downloads.acceptDanger(item.id);
-      accepted.push({ id: item.id, filename: item.filename });
-    } catch (err) {
-      console.warn('[AutomationBridge] acceptDanger failed:', item.id, err);
-    }
-  }
-
-  return { accepted, count: accepted.length };
+  console.warn(
+    '[AutomationBridge] acceptPendingDownloads skipped: acceptDanger unavailable in MV3 service worker; use blob-bypass',
+  );
+  return {
+    accepted: [],
+    count: 0,
+    skipped: 'acceptDanger-unavailable-in-service-worker-use-blob-bypass',
+  };
 }
 
 function trackExtensionDownload(id) {
@@ -904,20 +1003,34 @@ function trackExtensionDownload(id) {
 
 function resolveAbsoluteUrl(url, baseUrl) {
   if (!url) return null;
-  if (url.startsWith('http://') || url.startsWith('https://')) return url;
+  let fixed = url;
+  if (/^https?:\/\//i.test(url)) {
+    fixed = url.replace(/^(https?:\/\/[^/:]+):(\/)/i, '$1$2');
+  }
+  if (fixed.startsWith('http://') || fixed.startsWith('https://')) return fixed;
   try {
-    return new URL(url, baseUrl).href;
+    return new URL(fixed, baseUrl).href;
   } catch {
-    return url;
+    return fixed;
   }
 }
 
 function isLikelyDownloadUrl(url) {
   if (!url || typeof url !== 'string') return false;
-  const lower = url.toLowerCase();
-  if (/operationlog|operation\/log|\/add(?:\?|$)/i.test(lower)) return false;
+  const lower = url.toLowerCase().replace(/:\//g, '/');
+  if (
+    /operationlog|operation\/log|\/add(?:\?|$)|getattachmentdownloadinfolist|infolist/i.test(
+      lower,
+    )
+  ) {
+    return false;
+  }
   if (/\.(zip|xlsx|xls)(\?|$)/i.test(lower)) return true;
-  if (/\/download|\/export|attachment|filedownload|annex|getfile|downloadfile|file\/get/i.test(lower)) {
+  if (
+    /downloadattachment|\/download|exportfile|filedownload|getfile|downloadfile|file\/get/i.test(
+      lower,
+    )
+  ) {
     return true;
   }
   return false;
@@ -958,7 +1071,6 @@ function suggestFilename(url, response, serialNumber) {
 async function downloadWithSessionCookies(url, tabId, filename) {
   if (!url) throw new Error('url is required');
   setupDownloadListeners();
-  enableAutoAcceptDownloads({ durationMs: 15 * 60 * 1000 });
 
   const tab = await chrome.tabs.get(tabId);
   const absoluteUrl = resolveAbsoluteUrl(url, tab.url || url);
@@ -1009,60 +1121,71 @@ async function startDownload(params = {}) {
   return await downloadWithSessionCookies(params.url, tabId, params.filename);
 }
 
+async function tryBlobBypassForUrls(urls, tabId, tabUrl, serialNumber) {
+  const seen = new Set();
+  for (const raw of urls) {
+    if (!raw || seen.has(raw)) continue;
+    seen.add(raw);
+    const abs = resolveAbsoluteUrl(raw, tabUrl || '');
+    if (!isLikelyDownloadUrl(abs)) continue;
+    try {
+      return await downloadWithSessionCookies(
+        abs,
+        tabId,
+        suggestFilename(abs, null, serialNumber),
+      );
+    } catch (err) {
+      console.warn('[AutomationBridge] blob-bypass failed:', abs, err.message || err);
+    }
+  }
+  return null;
+}
+
 async function cpmsDownloadBySerial(params) {
   const tabId = await resolveTabId(params.tabId, params.recreateUrl);
   await chrome.tabs.update(tabId, { active: true });
-  enableAutoAcceptDownloads({ durationMs: 15 * 60 * 1000 });
-
   const tab = await chrome.tabs.get(tabId);
+  const tabUrl = tab.url || '';
 
-  // 首选路径：纯 DOM 探测拿到下载 URL，直接走 fetch+blob 旁路。
-  // 不模拟点击 → 不触发浏览器原生下载 → Chrome 不会弹"不安全下载"提示。
-  let probedUrl = null;
+  // 方案 A：不先点击。被动解析 URL → fetch+blob 保存（blob: 不触发 Chrome 危险提示）。
+  const candidateUrls = [];
   try {
-    const urlProbe = await runInTab('cpmsGetDownloadUrl', { ...params, tabId });
-    probedUrl = resolveAbsoluteUrl(urlProbe?.url, tab.url || '');
+    const resolved = await runInTab('cpmsResolveDownloadUrl', { ...params, tabId });
+    if (resolved?.best) candidateUrls.push(resolved.best);
+    if (Array.isArray(resolved?.urls)) candidateUrls.push(...resolved.urls);
   } catch (err) {
-    console.warn('[AutomationBridge] cpmsGetDownloadUrl failed:', err);
+    console.warn('[AutomationBridge] cpmsResolveDownloadUrl failed:', err.message || err);
   }
 
-  if (isLikelyDownloadUrl(probedUrl)) {
-    try {
-      return await downloadWithSessionCookies(
-        probedUrl,
-        tabId,
-        suggestFilename(probedUrl, null, params.serialNumber),
-      );
-    } catch (err) {
-      console.warn('[AutomationBridge] blob bypass failed on probed URL:', err);
-      // 继续走 click 兜底（不再 fallback 到 chrome.downloads.download(url)，
-      // 因为那条路径就是会触发 Chrome 危险提示的元凶）。
-    }
+  try {
+    const legacy = await runInTab('cpmsGetDownloadUrl', { ...params, tabId });
+    if (legacy?.url) candidateUrls.push(legacy.url);
+  } catch {
+    /* ignore */
   }
 
-  // 兜底路径：探测不到 URL 才点击。cpmsClickDownload 会 hook fetch/XHR/window.open，
-  // 尽量在原生下载真正发起之前从网络层抓到 URL，然后再走一次 blob 旁路。
-  // 若页面用 <a download> 或 location.href 触发下载，这一步可能仍会弹 Chrome 提示，
-  // 这是 DOM 探测彻底失败时的最后退路。
-  const clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
-  const clickedUrl = resolveAbsoluteUrl(
-    pickBestDownloadUrl(clickResult?.captured) || clickResult?.url,
-    tab.url || '',
-  );
+  const saved = await tryBlobBypassForUrls(candidateUrls, tabId, tabUrl, params.serialNumber);
+  if (saved) return saved;
 
-  if (isLikelyDownloadUrl(clickedUrl)) {
-    try {
-      return await downloadWithSessionCookies(
-        clickedUrl,
-        tabId,
-        clickResult?.filename || suggestFilename(clickedUrl, null, params.serialNumber),
-      );
-    } catch (err) {
-      console.warn('[AutomationBridge] blob bypass failed on clicked URL:', err);
-    }
+  console.warn('[AutomationBridge] passive URL resolve failed, sniffing on click...');
+  let sniffUrls = [];
+  try {
+    const sniff = await runInTab('cpmsSniffDownloadUrlOnClick', { ...params, tabId });
+    if (sniff?.url) sniffUrls.push(sniff.url);
+    if (Array.isArray(sniff?.captured)) sniffUrls.push(...sniff.captured);
+  } catch (err) {
+    console.warn('[AutomationBridge] cpmsSniffDownloadUrlOnClick failed:', err.message || err);
   }
 
-  return { ...(clickResult || {}), method: clickResult?.method || 'click-only' };
+  const sniffed = await tryBlobBypassForUrls(sniffUrls, tabId, tabUrl, params.serialNumber);
+  if (sniffed) return { ...sniffed, method: 'blob-bypass-sniff' };
+
+  return {
+    ok: false,
+    method: 'failed',
+    error: 'no-download-url',
+    candidates: candidateUrls.slice(0, 8),
+  };
 }
 
 function waitForDownload(params = {}) {
@@ -1104,9 +1227,6 @@ function waitForDownload(params = {}) {
                 mime: item.mime,
               });
               return;
-            }
-            if (item.danger && shouldAutoAcceptDownload(item)) {
-              chrome.downloads.acceptDanger(item.id).catch(() => {});
             }
           }
         }

@@ -569,7 +569,7 @@ internal static class CpmsWorkflow
     }
 
     /// <summary>
-    /// 全自动下载：磁盘监控优先，并行触发点击与 acceptDanger，文件落盘即返回（不依赖 tab 存活）。
+    /// 下载步骤：扩展 cpmsDownloadBySerial（被动解析 URL → blob 旁路），必要时轮询磁盘。
     /// </summary>
     public static async Task<string> CompleteDownloadStepAsync(
         ChromeController chrome,
@@ -579,253 +579,104 @@ internal static class CpmsWorkflow
         DateTime downloadStartedAt,
         int timeoutMs = 600000)
     {
-        Console.WriteLine("[6/7] 全自动下载（blob-bypass + 会话内 acceptDanger + 磁盘监控）");
+        Console.WriteLine("[6/7] 下载（被动解析 URL → blob 旁路，不触发 Chrome 危险下载提示）");
+        Console.WriteLine("[6/7] 详见 docs/download-troubleshooting.md");
 
-        try
+        var downloadsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads");
+        Console.WriteLine($"[6/7] 监控下载目录: {downloadsDir}");
+
+        var existing = FindRecentCpmsArchive(downloadsDir, downloadStartedAt);
+        if (existing is not null && File.Exists(existing))
         {
-            await chrome.EnableAutoAcceptDownloadsAsync(durationMs: timeoutMs + 60000);
+            Console.WriteLine($"[6/7] 下载文件已存在: {existing}");
+            return existing;
         }
-        catch
+
+        await RefreshDownloadListAsync(chrome, tabId);
+        await ChromeAutomationHelpers.DelayAsync(2000);
+
+        var maxAttempts = Math.Max(1, timeoutMs / 120000);
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            // 旧版扩展
-        }
-
-        try
-        {
-            var downloadsDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "Downloads");
-
-            var existing = FindRecentCpmsArchive(downloadsDir, downloadStartedAt);
-            if (existing is not null && File.Exists(existing))
-            {
-                Console.WriteLine($"[6/7] 下载文件已存在: {existing}");
-                return existing;
-            }
-
-            using var cts = new CancellationTokenSource(timeoutMs);
-
-            var diskTask = WaitForDownloadOnDiskAsync(
-                serialNumber ?? "",
-                timeoutMs,
-                downloadStartedAt);
-
-            var extensionDownloadTask = PollExtensionDownloadAsync(
-                chrome,
-                downloadStartedAt,
-                cts.Token);
-
-            var acceptLoop = Task.Run(async () =>
-            {
-                while (!cts.Token.IsCancellationRequested)
-                {
-                    try
-                    {
-                        await chrome.AcceptPendingDownloadsAsync(cts.Token);
-                    }
-                    catch
-                    {
-                        // ignore
-                    }
-
-                    await Task.Delay(3000, cts.Token);
-                }
-            }, cts.Token);
-
-            var clickTask = Task.Run(async () =>
-            {
-                await Task.Delay(500, cts.Token);
-                await TriggerDownloadClickAsync(chrome, serialNumber, tabId, downloadListUrl, cts.Token);
-            }, cts.Token);
-
+            Console.WriteLine($"[6/7] cpmsDownloadBySerial (第 {attempt} 次)...");
+            JsonElement? result = null;
             try
             {
-                var winner = await Task.WhenAny(diskTask, extensionDownloadTask);
-                var path = await winner;
-                Console.WriteLine($"[6/7] 下载完成: {path}");
-                return path;
+                result = await chrome.CommandAsync(
+                    "cpmsDownloadBySerial",
+                    new { serialNumber, tabId, recreateUrl = downloadListUrl });
             }
-            finally
+            catch (Exception ex)
             {
-                cts.Cancel();
-                try { await acceptLoop; } catch { /* cancelled */ }
-                try { await clickTask; } catch { /* cancelled */ }
+                CpmsDownloadDiagnostics.LogDownloadResult(null, ex);
             }
-        }
-        finally
-        {
-            try { await chrome.DisableAutoAcceptDownloadsAsync(); } catch { /* ignore */ }
-        }
-    }
 
-    private static async Task<string> PollExtensionDownloadAsync(
-        ChromeController chrome,
-        DateTime downloadStartedAt,
-        CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
+            CpmsDownloadDiagnostics.LogDownloadResult(result);
+
+            if (result?.TryGetProperty("method", out var methodProp) == true)
             {
-                var download = await chrome.WaitForDownloadAsync(
-                    filenameContains: null,
-                    timeoutMs: 5000,
-                    since: downloadStartedAt);
-                if (download?.TryGetProperty("filename", out var filenameProp) == true)
+                var method = methodProp.GetString() ?? "";
+                if (method.StartsWith("blob-bypass", StringComparison.OrdinalIgnoreCase))
                 {
-                    var path = filenameProp.GetString();
-                    if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                    var path = ResolveDownloadedFilePath(result.Value, downloadsDir);
+                    if (!string.IsNullOrEmpty(path) && File.Exists(path))
                     {
-                        Console.WriteLine($"[6/7] Chrome 下载 API 检测到文件: {path}");
+                        Console.WriteLine($"[6/7] 下载完成: {path}");
                         return path;
                     }
                 }
             }
-            catch
-            {
-                // keep polling
-            }
-
-            await Task.Delay(2000, cancellationToken);
-        }
-
-        throw new OperationCanceledException(cancellationToken);
-    }
-
-    private static async Task TriggerDownloadClickAsync(
-        ChromeController chrome,
-        string? serialNumber,
-        int? tabId,
-        string downloadListUrl,
-        CancellationToken cancellationToken)
-    {
-        var clickParams = new
-        {
-            serialNumber,
-            tabId,
-            recreateUrl = downloadListUrl,
-        };
-
-        var attempt = 0;
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            attempt++;
-            try
-            {
-                await RefreshDownloadListAsync(chrome, tabId);
-                await ChromeAutomationHelpers.DelayAsync(1500, cancellationToken);
-
-                if (!string.IsNullOrEmpty(serialNumber))
-                {
-                    var status = await GetExportRowStatusAsync(chrome, serialNumber, tabId);
-                    if (status is { Success: false, Processing: true })
-                    {
-                        Console.WriteLine($"[6/7] 后台仍在处理，等待后重试 (第 {attempt} 次)...");
-                        await Task.Delay(10000, cancellationToken);
-                        continue;
-                    }
-
-                    if (status is not { Success: true })
-                    {
-                        Console.WriteLine($"[6/7] 任务行状态: {status?.RawStatus ?? "未找到"}，刷新后重试 (第 {attempt} 次)...");
-                    }
-                }
-
-                Console.WriteLine($"[6/7] 触发下载点击 (第 {attempt} 次)...");
-                if (!string.IsNullOrEmpty(serialNumber))
-                {
-                    var result = await chrome.CommandAsync(
-                        "cpmsDownloadBySerial",
-                        clickParams,
-                        cancellationToken,
-                        timeoutMs: 120000);
-                    LogDownloadResult(result);
-                }
-                else
-                {
-                    await chrome.CommandAsync(
-                        "cpmsClickFirstReadyDownload",
-                        clickParams,
-                        cancellationToken,
-                        timeoutMs: 60000);
-                }
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                Console.WriteLine($"[6/7] cpmsDownloadBySerial: {ex.Message}");
-            }
 
             try
             {
-                if (!string.IsNullOrEmpty(serialNumber))
+                var diskPath = await WaitForDownloadOnDiskAsync(
+                    serialNumber ?? "",
+                    60000,
+                    downloadStartedAt);
+                if (!string.IsNullOrEmpty(diskPath) && File.Exists(diskPath))
                 {
-                    var click = await chrome.CommandAsync(
-                        "cpmsClickDownload",
-                        clickParams,
-                        cancellationToken,
-                        timeoutMs: 60000);
-                    LogDownloadResult(click);
-                    if (click?.TryGetProperty("url", out var urlProp) == true)
-                    {
-                        var url = urlProp.GetString();
-                        if (!string.IsNullOrWhiteSpace(url) &&
-                            url.Contains("download", StringComparison.OrdinalIgnoreCase))
-                        {
-                            await chrome.CommandAsync(
-                                "startDownload",
-                                new { url, tabId, recreateUrl = downloadListUrl },
-                                cancellationToken,
-                                timeoutMs: 120000);
-                        }
-                    }
+                    Console.WriteLine($"[6/7] 磁盘检测到文件: {diskPath}");
+                    return diskPath;
                 }
-
-                await chrome.CommandAsync(
-                    "clickByText",
-                    new { text = "下载", exact = true, tabId, recreateUrl = downloadListUrl },
-                    cancellationToken,
-                    timeoutMs: 30000);
-                await chrome.AcceptPendingDownloadsAsync(cancellationToken);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException)
             {
-                Console.WriteLine($"[6/7] 下载点击回退: {ex.Message}");
+                // 本轮磁盘等待超时
             }
 
-            await Task.Delay(15000, cancellationToken);
+            await RefreshDownloadListAsync(chrome, tabId);
+            await Task.Delay(8000);
         }
+
+        throw new TimeoutException(
+            string.IsNullOrEmpty(serialNumber)
+                ? "等待下载文件超时"
+                : $"等待下载文件超时，流水号: {serialNumber}");
     }
 
-    private static void LogDownloadResult(JsonElement? result)
+    private static string? ResolveDownloadedFilePath(JsonElement result, string downloadsDir)
     {
-        if (result is null)
+        if (result.TryGetProperty("filename", out var fn))
         {
-            return;
-        }
-
-        if (result.Value.TryGetProperty("method", out var method))
-        {
-            Console.WriteLine($"[6/7] 下载策略: {method.GetString()}");
-        }
-
-        if (result.Value.TryGetProperty("filename", out var filename))
-        {
-            Console.WriteLine($"[6/7] 目标文件: {filename.GetString()}");
-        }
-
-        if (result.Value.TryGetProperty("sourceUrl", out var sourceUrl))
-        {
-            Console.WriteLine($"[6/7] 下载 URL: {sourceUrl.GetString()}");
-        }
-
-        if (result.Value.TryGetProperty("captured", out var captured) && captured.ValueKind == JsonValueKind.Array)
-        {
-            var urls = string.Join(", ", captured.EnumerateArray().Select(e => e.GetString()).Where(s => !string.IsNullOrEmpty(s)).Take(5));
-            if (!string.IsNullOrEmpty(urls))
+            var name = fn.GetString();
+            if (!string.IsNullOrWhiteSpace(name))
             {
-                Console.WriteLine($"[6/7] 捕获 URL: {urls}");
+                if (Path.IsPathRooted(name) && File.Exists(name))
+                {
+                    return name;
+                }
+
+                var combined = Path.Combine(downloadsDir, name);
+                if (File.Exists(combined))
+                {
+                    return combined;
+                }
             }
         }
+
+        return FindRecentCpmsArchive(downloadsDir, DateTime.UtcNow.AddMinutes(-5));
     }
 
     public static async Task ClickDownloadInRowAsync(ChromeController chrome, string serialNumber, int? tabId = null)
@@ -833,41 +684,13 @@ internal static class CpmsWorkflow
         try
         {
             var result = await chrome.CommandAsync("cpmsDownloadBySerial", new { serialNumber, tabId });
-            if (result?.TryGetProperty("method", out var methodProp) == true)
-            {
-                Console.WriteLine($"[6/7] 下载策略: {methodProp.GetString()}");
-            }
-            if (result?.TryGetProperty("filename", out var fn) == true)
-            {
-                Console.WriteLine($"[6/7] 目标文件: {fn.GetString()}");
-            }
+            CpmsDownloadDiagnostics.LogDownloadResult(result);
             return;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[6/7] cpmsDownloadBySerial 失败: {ex.Message}");
+            CpmsDownloadDiagnostics.LogDownloadResult(null, ex);
         }
-
-        try
-        {
-            var click = await chrome.CommandAsync("cpmsClickDownload", new { serialNumber, tabId });
-            if (click?.TryGetProperty("url", out var urlProp) == true)
-            {
-                var url = urlProp.GetString();
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    await chrome.CommandAsync("startDownload", new { url, tabId });
-                    return;
-                }
-            }
-        }
-        catch
-        {
-            // fallback
-        }
-
-        await chrome.ClickByTextAsync("下载", exact: true, tabId: tabId);
-        try { await chrome.AcceptPendingDownloadsAsync(); } catch { /* ignore */ }
     }
 
     public static async Task ClickFirstReadyDownloadAsync(ChromeController chrome, int? tabId = null)

@@ -60,7 +60,7 @@ When changing `CpmsExport` behavior, keep these invariants — they reflect deli
 - **Tab reuse is keyed on URL substring `cpms.hq.cmcc`**, not on tab title.
 - **Report page detection** combines URL match (`BigTableDefind` / `wideTable`), absence of `attachmentDownload`/`mops/tools`, presence of the "导出" button (preferred) or strong body markers ("项目明细查询报表", "显示列配置", "字段说明"), and a negative check for the login page.
 - **Serial number** is parsed from the export confirmation dialog via regex `流水号[为：:\s]*(\d+)`. If parsing fails the workflow falls back to "latest row in the download list."
-- **Download resolution** is multi-path: `cpmsDownloadBySerial` → `cpmsClickDownload` + `startDownload` → click "下载" by text + `acceptPendingDownloads`. The disk-watch fallback (`WaitForDownloadOnDiskAsync`) scans `~/Downloads` for `*{serial}*.xlsx|zip` and for filenames matching CPMS's date-stamped pattern `\d{4}-\d{2}-\d{2}-\d{2}-\d+\.zip`. Keep all fallback paths intact.
+- **Download resolution**: `cpmsDownloadBySerial` resolves URL via `cpmsResolveDownloadUrl` (DOM + list API), then `downloadWithSessionCookies` (fetch + blob URL). Sniff-on-click (`cpmsSniffDownloadUrlOnClick`) is last resort. Do **not** rely on `acceptDanger` (unavailable in MV3 service worker). See `docs/download-troubleshooting.md`.
 - **Long-running downloads need the offscreen keepalive.** Any new action that may take >30s should either match the `Download`/`cpms*` naming convention (so the bridge auto-bumps timeout to 300s) or pass an explicit `timeoutMs`. The extension's `executeAction` also uses the same naming convention to decide when to spin up the offscreen document.
 
 ## Environment variables

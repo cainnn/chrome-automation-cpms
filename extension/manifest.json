@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Automation Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "允许外部程序通过 WebSocket 桥接控制 Chrome 浏览器",
   "permissions": [
     "tabs",

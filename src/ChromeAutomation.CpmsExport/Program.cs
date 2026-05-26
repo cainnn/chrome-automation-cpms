@@ -44,6 +44,8 @@ catch (Exception ex)
 {
     Console.WriteLine();
     Console.WriteLine($"错误: {ex.Message}");
+    CpmsDownloadDiagnostics.AppendRunLog($"[{DateTime.Now:O}] FATAL {ex}");
+    CpmsDownloadDiagnostics.LogDownloadResult(null, ex);
     Environment.Exit(1);
 }
 
