@@ -1004,16 +1004,9 @@ async function downloadWithSessionCookies(url, tabId, filename) {
 async function startDownload(params = {}) {
   if (!params.url) throw new Error('url is required');
   const tabId = await resolveTabId(params.tabId);
-  try {
-    return await downloadWithSessionCookies(params.url, tabId, params.filename);
-  } catch (err) {
-    console.warn('[AutomationBridge] blob-bypass failed, fallback to direct download:', err);
-    setupDownloadListeners();
-    enableAutoAcceptDownloads({ durationMs: 15 * 60 * 1000 });
-    const id = await chrome.downloads.download({ url: params.url, saveAs: false });
-    trackExtensionDownload(id);
-    return { id, method: 'direct-url' };
-  }
+  // 只走 blob 旁路。chrome.downloads.download({ url }) 会重新触发 Chrome 危险提示，
+  // 而 acceptDanger 在 service worker 里无法生效，所以失败时直接抛错让上层兜底。
+  return await downloadWithSessionCookies(params.url, tabId, params.filename);
 }
 
 async function cpmsDownloadBySerial(params) {
@@ -1022,41 +1015,53 @@ async function cpmsDownloadBySerial(params) {
   enableAutoAcceptDownloads({ durationMs: 15 * 60 * 1000 });
 
   const tab = await chrome.tabs.get(tabId);
-  let downloadUrl = null;
 
+  // 首选路径：纯 DOM 探测拿到下载 URL，直接走 fetch+blob 旁路。
+  // 不模拟点击 → 不触发浏览器原生下载 → Chrome 不会弹"不安全下载"提示。
+  let probedUrl = null;
   try {
     const urlProbe = await runInTab('cpmsGetDownloadUrl', { ...params, tabId });
-    downloadUrl = resolveAbsoluteUrl(urlProbe?.url, tab.url || '');
+    probedUrl = resolveAbsoluteUrl(urlProbe?.url, tab.url || '');
   } catch (err) {
     console.warn('[AutomationBridge] cpmsGetDownloadUrl failed:', err);
   }
 
-  const clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
-  if (!isLikelyDownloadUrl(downloadUrl)) {
-    downloadUrl = resolveAbsoluteUrl(pickBestDownloadUrl(clickResult?.captured) || clickResult?.url, tab.url || '');
-  }
-
-  if (isLikelyDownloadUrl(downloadUrl)) {
+  if (isLikelyDownloadUrl(probedUrl)) {
     try {
       return await downloadWithSessionCookies(
-        downloadUrl,
+        probedUrl,
         tabId,
-        clickResult?.filename || suggestFilename(downloadUrl, null, params.serialNumber),
+        suggestFilename(probedUrl, null, params.serialNumber),
       );
     } catch (err) {
-      console.warn('[AutomationBridge] session download failed:', err);
-      try {
-        const id = await chrome.downloads.download({ url: downloadUrl, saveAs: false });
-        trackExtensionDownload(id);
-        await acceptPendingDownloads();
-        return { id, sourceUrl: downloadUrl, method: 'direct-fallback', error: err.message };
-      } catch (err2) {
-        console.warn('[AutomationBridge] direct download failed:', err2);
-      }
+      console.warn('[AutomationBridge] blob bypass failed on probed URL:', err);
+      // 继续走 click 兜底（不再 fallback 到 chrome.downloads.download(url)，
+      // 因为那条路径就是会触发 Chrome 危险提示的元凶）。
     }
   }
 
-  await acceptPendingDownloads();
+  // 兜底路径：探测不到 URL 才点击。cpmsClickDownload 会 hook fetch/XHR/window.open，
+  // 尽量在原生下载真正发起之前从网络层抓到 URL，然后再走一次 blob 旁路。
+  // 若页面用 <a download> 或 location.href 触发下载，这一步可能仍会弹 Chrome 提示，
+  // 这是 DOM 探测彻底失败时的最后退路。
+  const clickResult = await runInTab('cpmsClickDownload', { ...params, tabId });
+  const clickedUrl = resolveAbsoluteUrl(
+    pickBestDownloadUrl(clickResult?.captured) || clickResult?.url,
+    tab.url || '',
+  );
+
+  if (isLikelyDownloadUrl(clickedUrl)) {
+    try {
+      return await downloadWithSessionCookies(
+        clickedUrl,
+        tabId,
+        clickResult?.filename || suggestFilename(clickedUrl, null, params.serialNumber),
+      );
+    } catch (err) {
+      console.warn('[AutomationBridge] blob bypass failed on clicked URL:', err);
+    }
+  }
+
   return { ...(clickResult || {}), method: clickResult?.method || 'click-only' };
 }
 
