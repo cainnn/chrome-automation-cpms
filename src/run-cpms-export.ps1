@@ -62,7 +62,7 @@ if ($env:CPMS_USE_KEEP_CLICKER -eq "1") {
 
 $logFile = Join-Path $Root "last-run.log"
 try {
-    dotnet run --project ChromeAutomation.CpmsExport 2>&1 | Tee-Object -FilePath $logFile -Encoding utf8
+    dotnet run --project ChromeAutomation.CpmsExport 2>&1 | Tee-Object -FilePath $logFile
     $exitCode = $LASTEXITCODE
 }
 finally {

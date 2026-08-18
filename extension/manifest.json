@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Chrome Automation Bridge",
-  "version": "1.1.0",
+  "version": "1.3.2",
   "description": "允许外部程序通过 WebSocket 桥接控制 Chrome 浏览器",
   "permissions": [
     "tabs",
+    "windows",
     "scripting",
     "storage",
     "activeTab",
@@ -34,5 +35,11 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["accept-download.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

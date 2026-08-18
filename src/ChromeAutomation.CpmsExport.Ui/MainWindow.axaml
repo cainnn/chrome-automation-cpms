@@ -1,0 +1,170 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ChromeAutomation.CpmsExport.Ui.MainWindow"
+        Title="自动化工具"
+        Width="860" Height="720"
+        MinWidth="700" MinHeight="550"
+        WindowStartupLocation="CenterScreen"
+        TransparencyLevelHint="None"
+        Background="White">
+
+  <Window.Styles>
+    <!-- LogBox: suppress hover/focus background change -->
+    <Style Selector="TextBox#LogBox /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="#1E1E1E" />
+    </Style>
+    <Style Selector="TextBox#LogBox:pointerover /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="#1E1E1E" />
+    </Style>
+    <Style Selector="TextBox#LogBox:focus /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="#1E1E1E" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+    </Style>
+  </Window.Styles>
+
+  <Grid Margin="12" ColumnDefinitions="180,*">
+
+    <!-- Left: Task list -->
+    <Border Grid.Column="0" Background="#F6F6F6" CornerRadius="6" Padding="8" Margin="0,0,8,0">
+      <DockPanel>
+        <TextBlock DockPanel.Dock="Top" Text="任务列表" FontWeight="SemiBold" Margin="4,4,4,8" />
+        <ListBox x:Name="TaskList" SelectionMode="Single">
+          <ListBoxItem x:Name="TaskCpmsExport" Content="CPMS 项目明细" IsSelected="True" />
+          <ListBoxItem x:Name="TaskErpExport" Content="ERP 支出明细" />
+          <ListBoxItem x:Name="TaskPlaceholder2" Content="(预留任务 2)" IsEnabled="False" Opacity="0.4" />
+        </ListBox>
+      </DockPanel>
+    </Border>
+
+    <!-- Right: Task panel -->
+    <Grid Grid.Column="1" RowDefinitions="Auto,Auto,*,Auto">
+
+      <!-- Action bar -->
+      <Border Grid.Row="0" Background="#F6F6F6" CornerRadius="6" Padding="12" Margin="0,0,0,8">
+        <Grid ColumnDefinitions="Auto,Auto,Auto,*,Auto">
+          <Button x:Name="RunButton"
+                  Grid.Column="0"
+                  Content="开始"
+                  MinWidth="100" />
+
+          <Button x:Name="StopButton"
+                  Grid.Column="1"
+                  Content="停止"
+                  IsEnabled="False"
+                  Margin="8,0,0,0"
+                  MinWidth="60" />
+
+          <ToggleSwitch x:Name="ScheduleToggle"
+                        Grid.Column="2"
+                        Content="定时任务"
+                        Margin="16,0,0,0"
+                        IsChecked="False" />
+
+          <TextBlock x:Name="StatusText"
+                     Grid.Column="3"
+                     Text="空闲"
+                     VerticalAlignment="Center"
+                     HorizontalAlignment="Right"
+                     Margin="0,0,12,0"
+                     FontWeight="SemiBold" />
+
+          <TextBlock x:Name="NextRunText"
+                     Grid.Column="4"
+                     Text=""
+                     VerticalAlignment="Center"
+                     Foreground="Gray" />
+        </Grid>
+      </Border>
+
+      <!-- Schedule config -->
+      <Border x:Name="SchedulePanel"
+              Grid.Row="1"
+              Background="#FAFAFA"
+              CornerRadius="6"
+              Padding="12,8"
+              Margin="0,0,0,8"
+              IsVisible="False">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="每天" VerticalAlignment="Center" />
+          <TextBox x:Name="ScheduleHourBox"
+                   Text="08"
+                   Width="50"
+                   HorizontalContentAlignment="Center"
+                   VerticalAlignment="Center" />
+          <TextBlock Text="时" VerticalAlignment="Center" />
+          <TextBox x:Name="ScheduleMinuteBox"
+                   Text="00"
+                   Width="50"
+                   HorizontalContentAlignment="Center"
+                   VerticalAlignment="Center" />
+          <TextBlock Text="分 自动执行" VerticalAlignment="Center" />
+        </StackPanel>
+      </Border>
+
+      <!-- Log output -->
+      <Border Grid.Row="2" Background="#1E1E1E" BorderBrush="#DDD" BorderThickness="1" CornerRadius="4" Margin="0,0,0,8">
+          <TextBox x:Name="LogBox"
+                   IsReadOnly="True"
+                   AcceptsReturn="True"
+                   TextWrapping="Wrap"
+                   FontFamily="Consolas,Courier New,monospace"
+                   FontSize="13"
+                   Background="#1E1E1E"
+                   Foreground="#D4D4D4"
+                   Padding="8"
+                   BorderThickness="0"
+                   ScrollViewer.VerticalScrollBarVisibility="Auto"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled" />
+      </Border>
+
+      <!-- Settings (expander) -->
+      <Expander Grid.Row="3" Header="设置" IsExpanded="False">
+        <StackPanel Spacing="8" Margin="0,8,0,0">
+
+          <!-- CPMS Export settings -->
+          <StackPanel x:Name="CpmsSettingsPanel" Spacing="8">
+            <Grid ColumnDefinitions="100,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+              <TextBlock Grid.Row="0" Grid.Column="0" Text="报表 URL" VerticalAlignment="Center" />
+              <TextBox  Grid.Row="0" Grid.Column="1" x:Name="ReportUrlBox" Watermark="http://cpms.hq.cmcc/pms/#/..." />
+
+              <TextBlock Grid.Row="1" Grid.Column="0" Text="下载列表 URL" VerticalAlignment="Center" Margin="0,6,0,0" />
+              <TextBox  Grid.Row="1" Grid.Column="1" x:Name="DownloadUrlBox" Watermark="http://cpms.hq.cmcc/pms/#/..." Margin="0,6,0,0" />
+
+              <TextBlock Grid.Row="2" Grid.Column="0" Text="连接字符串" VerticalAlignment="Center" Margin="0,6,0,0" />
+              <TextBox  Grid.Row="2" Grid.Column="1" x:Name="ConnectionStringBox" Watermark="Server=...;Database=PersonalPMS;..." Margin="0,6,0,0" />
+
+              <TextBlock Grid.Row="3" Grid.Column="0" Text="Aspose 许可证" VerticalAlignment="Center" Margin="0,6,0,0" />
+              <TextBox  Grid.Row="3" Grid.Column="1" x:Name="AsposeLicenseBox" Watermark="D:\AsposeLicense\Aspose.Total.lic" Margin="0,6,0,0" />
+            </Grid>
+
+            <StackPanel Orientation="Horizontal" Spacing="24">
+              <CheckBox x:Name="SkipExportCheck" Content="跳过导出（仅下载）" />
+              <CheckBox x:Name="ForceNewTabCheck" Content="强制新标签页" />
+            </StackPanel>
+          </StackPanel>
+
+          <!-- ERP settings -->
+          <StackPanel x:Name="ErpSettingsPanel" Spacing="8" IsVisible="False">
+            <Grid ColumnDefinitions="100,*" RowDefinitions="Auto,Auto,Auto">
+              <TextBlock Grid.Row="0" Grid.Column="0" Text="门户 URL" VerticalAlignment="Center" />
+              <TextBox  Grid.Row="0" Grid.Column="1" x:Name="ErpPortalUrlBox" Watermark="http://cpszz.hq.cmcc/oldHome" />
+
+              <TextBlock Grid.Row="1" Grid.Column="0" Text="菜单展开" VerticalAlignment="Center" Margin="0,6,0,0" />
+              <TextBox  Grid.Row="1" Grid.Column="1" x:Name="ErpTreeExpandBox" Watermark="展开 303310PA_..." Margin="0,6,0,0" />
+
+              <TextBlock Grid.Row="2" Grid.Column="0" Text="CUX 链接" VerticalAlignment="Center" Margin="0,6,0,0" />
+              <TextBox  Grid.Row="2" Grid.Column="1" x:Name="ErpCuxTextBox" Watermark="CUX:查询项目支出" Margin="0,6,0,0" />
+            </Grid>
+            <CheckBox x:Name="ErpSkipImportCheck" Content="跳过导入（仅导出）" />
+            <TextBlock Text="连接字符串与 Aspose 许可证使用上方 CPMS 设置中的值。" Foreground="Gray" FontSize="12" />
+          </StackPanel>
+
+          <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+            <Button x:Name="SaveSettingsButton" Content="保存设置" MinWidth="80" />
+          </StackPanel>
+        </StackPanel>
+      </Expander>
+
+    </Grid>
+  </Grid>
+</Window>

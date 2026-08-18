@@ -1,13 +1,18 @@
+using System.Net.WebSockets;
 using System.Text.Json;
+using ChromeAutomation.Bridge;
 using ChromeAutomation.Client;
 using ChromeAutomation.CpmsExport;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 
 const string ReportUrl = "http://cpms.hq.cmcc/pms/#/mdat/wideTable/BigTableDefind";
 var downloadListUrl = Environment.GetEnvironmentVariable("CPMS_EXPORT_TASK_URL")
     ?? "http://cpms.hq.cmcc/pms/#/mops/tools/attachmentDownload/list";
 
 Console.WriteLine("=== CPMS 项目明细导出 + 数据库导入 ===");
-Console.WriteLine("请确保：1) 桥接服务器已启动  2) Chrome 扩展已连接  3) 浏览器已登录 CPMS");
+Console.WriteLine("请确保：1) Chrome 扩展已连接  2) 浏览器已登录 CPMS");
 Console.WriteLine("重要：请在 chrome://extensions/ 刷新扩展后再运行");
 Console.WriteLine();
 
@@ -23,14 +28,68 @@ if (!string.IsNullOrWhiteSpace(excelOnly))
     return;
 }
 
+var runDiag = string.Equals(
+    Environment.GetEnvironmentVariable("CPMS_DIAG"),
+    "1",
+    StringComparison.OrdinalIgnoreCase);
+var httpOnly = string.Equals(
+    Environment.GetEnvironmentVariable("CPMS_HTTP_ONLY"),
+    "1",
+    StringComparison.OrdinalIgnoreCase);
 var skipExport = string.Equals(
     Environment.GetEnvironmentVariable("CPMS_SKIP_EXPORT"),
     "1",
     StringComparison.OrdinalIgnoreCase);
 var presetSerial = Environment.GetEnvironmentVariable("CPMS_SERIAL");
+var handleJavaDialog = string.Equals(
+    Environment.GetEnvironmentVariable("HANDLE_JAVA_DIALOG"),
+    "1",
+    StringComparison.OrdinalIgnoreCase);
+
+if (httpOnly)
+{
+    var serial = presetSerial ?? throw new InvalidOperationException("CPMS_HTTP_ONLY 需要设置 CPMS_SERIAL");
+    var downloadsDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        "Downloads");
+    await using var chrome = new ChromeController();
+    await chrome.ConnectAsync();
+    await WaitForExtensionAsync(chrome);
+    await EnsureExtensionReloadedAsync(chrome);
+    var downloaded = await CpmsHttpDownloader.TryDownloadBySerialAsync(
+        serial,
+        downloadsDir,
+        DateTime.UtcNow.AddHours(-24),
+        chrome)
+        ?? throw new InvalidOperationException($"HTTP 下载失败，流水号: {serial}");
+    var excelPath = downloaded.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)
+        ? downloaded
+        : CpmsWorkflow.ResolveExcelPath(downloaded);
+    Console.WriteLine($"[HTTP] Excel: {excelPath}");
+    await CpmsWorkflow.RunDatabaseImportAsync(excelPath);
+    Console.WriteLine("全部完成。");
+    return;
+}
+
+// Start embedded bridge server if no external one is running
+await StartBridgeIfNeededAsync();
 
 try
 {
+    if (handleJavaDialog)
+    {
+        Console.WriteLine("[Java 弹窗处理模式] 等待并处理 Java 安全弹窗...");
+        var javaResult = await JavaDialogHelper.HandleSecurityDialogAsync();
+        Console.WriteLine(javaResult ? "✓ Java 安全弹窗已处理" : "✗ 未检测到弹窗或处理失败");
+        return;
+    }
+
+    if (runDiag)
+    {
+        await CpmsDiag.RunAsync(presetSerial);
+        return;
+    }
+
     if (skipExport)
     {
         await RunDownloadOnlyAsync(downloadListUrl, presetSerial);
@@ -115,6 +174,7 @@ static async Task RunDownloadOnlyAsync(string downloadListUrl, string? presetSer
         Console.WriteLine("[下载模式] 已连接桥接服务器");
         await ChromeAutomationHelpers.DelayAsync(3000);
         await WaitForExtensionAsync(chrome);
+        await EnsureExtensionReloadedAsync(chrome);
 
         var workTabId = await GetOrNavigateTabAsync(chrome, downloadListUrl, "[下载模式]");
         workTabId = await CpmsWorkflow.EnsureDownloadListPageAsync(
@@ -140,18 +200,13 @@ static async Task RunDownloadOnlyAsync(string downloadListUrl, string? presetSer
         }
 
         var downloadStartedAt = DateTime.UtcNow;
-        var downloadedPath = await CpmsWorkflow.CompleteDownloadStepAsync(
+        await CpmsWorkflow.CompleteDownloadAndImportAsync(
             chrome,
             serialNumber,
             workTabId,
             downloadListUrl,
-            downloadStartedAt);
-
-        var excelPath = downloadedPath.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)
-            ? downloadedPath
-            : CpmsWorkflow.ResolveExcelPath(downloadedPath);
-        Console.WriteLine($"[下载模式] Excel: {excelPath}");
-        await CpmsWorkflow.RunDatabaseImportAsync(excelPath);
+            downloadStartedAt,
+            Console.WriteLine);
         Console.WriteLine("全部完成。Chrome 保持打开，未关闭任何标签页。");
     }
     finally
@@ -171,6 +226,7 @@ static async Task RunAsync(string reportUrl, string downloadListUrl)
         await ChromeAutomationHelpers.DelayAsync(3000);
 
         await WaitForExtensionAsync(chrome);
+        await EnsureExtensionReloadedAsync(chrome);
         Console.WriteLine("[1/7] Chrome 扩展已就绪");
 
         Console.WriteLine($"[2/7] 定位报表页: {reportUrl}");
@@ -216,32 +272,38 @@ static async Task RunAsync(string reportUrl, string downloadListUrl)
             throw;
         }
 
-        if (string.IsNullOrEmpty(serialNumber))
+        await CpmsWorkflow.RefreshDownloadListAsync(chrome, workTabId);
+        var listSerial = await CpmsWorkflow.GetLatestSerialAsync(chrome, workTabId);
+        if (!string.IsNullOrEmpty(listSerial))
         {
-            serialNumber = await CpmsWorkflow.GetLatestSerialAsync(chrome, workTabId);
-            Console.WriteLine(serialNumber is not null
-                ? $"[4/7] 使用列表最新流水号: {serialNumber}"
-                : "[4/7] 将使用列表中第一条可下载任务");
+            if (!string.IsNullOrEmpty(serialNumber) && serialNumber != listSerial)
+            {
+                Console.WriteLine($"[4/7] 弹窗流水号 {serialNumber}，列表最新 {listSerial}，使用列表最新");
+            }
+            else
+            {
+                Console.WriteLine($"[4/7] 使用列表最新流水号: {listSerial}");
+            }
+
+            serialNumber = listSerial;
+        }
+        else if (string.IsNullOrEmpty(serialNumber))
+        {
+            Console.WriteLine("[4/7] 列表暂无流水号，将使用第一条可下载任务");
         }
 
         await CpmsWorkflow.WaitForBackendReadyAsync(chrome, serialNumber, workTabId);
 
-        Console.WriteLine("[6/7] 全自动下载并导入");
+        Console.WriteLine("[6/7] 全自动下载（UIA 保留）并导入数据库");
         var downloadStartedAt = DateTime.UtcNow;
 
-        var downloadedPath = await CpmsWorkflow.CompleteDownloadStepAsync(
+        await CpmsWorkflow.CompleteDownloadAndImportAsync(
             chrome,
             serialNumber,
             workTabId,
             downloadListUrl,
-            downloadStartedAt);
-
-        var excelPath = downloadedPath.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)
-            ? downloadedPath
-            : CpmsWorkflow.ResolveExcelPath(downloadedPath);
-        Console.WriteLine($"[6/7] Excel 路径: {excelPath}");
-
-        await CpmsWorkflow.RunDatabaseImportAsync(excelPath);
+            downloadStartedAt,
+            Console.WriteLine);
 
         Console.WriteLine();
         Console.WriteLine("全部完成。Chrome 保持打开，未关闭任何标签页。");
@@ -277,6 +339,78 @@ static async Task LogPageDebugAsync(ChromeController chrome, int? tabId, string 
     }
 }
 
+static async Task EnsureExtensionReloadedAsync(ChromeController chrome, string targetVersion = "1.3.2")
+{
+    var autoReload = !string.Equals(
+        Environment.GetEnvironmentVariable("CPMS_NO_RELOAD_EXT"),
+        "1",
+        StringComparison.OrdinalIgnoreCase);
+
+    if (!autoReload)
+    {
+        return;
+    }
+
+    string? current = null;
+    try
+    {
+        var ver = await chrome.CommandAsync("getExtensionVersion", timeoutMs: 5000);
+        current = ver?.TryGetProperty("version", out var v) == true ? v.GetString() : null;
+    }
+    catch
+    {
+        // 旧版扩展无 getExtensionVersion
+    }
+
+    if (string.Equals(current, targetVersion, StringComparison.Ordinal))
+    {
+        Console.WriteLine($"[扩展] 版本 {current} 已就绪");
+        return;
+    }
+
+    Console.WriteLine($"[扩展] 重载扩展（当前 {current ?? "旧版"} → 目标 {targetVersion}）...");
+    var reloaded = false;
+    try
+    {
+        await chrome.CommandAsync("reloadExtension", timeoutMs: 5000);
+        reloaded = true;
+        Console.WriteLine("[扩展] 已通过 reloadExtension 触发重载");
+    }
+    catch
+    {
+        // 旧版扩展无 reloadExtension
+    }
+
+    if (!reloaded)
+    {
+        try
+        {
+            await chrome.CommandAsync("createTab", new { url = "chrome://extensions/", active = true });
+        }
+        catch
+        {
+            // ignore
+        }
+
+        await ChromeAutomationHelpers.DelayAsync(3000);
+        await ChromeUiaHelper.RefreshExtensionAsync();
+    }
+
+    await ChromeAutomationHelpers.DelayAsync(6000);
+    await WaitForExtensionAsync(chrome, 60000);
+
+    try
+    {
+        var ver = await chrome.CommandAsync("getExtensionVersion", timeoutMs: 10000);
+        current = ver?.TryGetProperty("version", out var v) == true ? v.GetString() : null;
+        Console.WriteLine($"[扩展] 重载后版本: {current ?? "未知"}");
+    }
+    catch
+    {
+        Console.WriteLine("[扩展] 重载后仍无法读取版本，请手动在 chrome://extensions/ 点击「重新加载」");
+    }
+}
+
 static async Task WaitForExtensionAsync(ChromeController chrome, int timeoutMs = 30000)
 {
     var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
@@ -295,4 +429,47 @@ static async Task WaitForExtensionAsync(ChromeController chrome, int timeoutMs =
     }
 
     throw new InvalidOperationException("Chrome 扩展未连接。请刷新扩展并点击「重新连接」。");
+}
+
+static async Task StartBridgeIfNeededAsync()
+{
+    var port = int.TryParse(Environment.GetEnvironmentVariable("BRIDGE_PORT"), out var p) ? p : 9333;
+    var testUrl = $"ws://127.0.0.1:{port}/";
+
+    // Check if an external bridge is already running
+    try
+    {
+        using var testWs = new ClientWebSocket();
+        await testWs.ConnectAsync(new Uri(testUrl), CancellationToken.None);
+        await testWs.CloseAsync(WebSocketCloseStatus.NormalClosure, "test", CancellationToken.None);
+        Console.WriteLine($"[Bridge] 外部桥接服务器已在端口 {port} 运行，无需启动");
+        return;
+    }
+    catch (WebSocketException)
+    {
+        // Port not listening — start embedded bridge
+    }
+
+    var bridge = new BridgeHost();
+    var builder = WebApplication.CreateSlimBuilder();
+    builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+    var app = builder.Build();
+    app.UseWebSockets();
+    app.Map("/", async context =>
+    {
+        if (!context.WebSockets.IsWebSocketRequest)
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return;
+        }
+        using var socket = await context.WebSockets.AcceptWebSocketAsync();
+        await bridge.HandleConnectionAsync(socket, context.RequestAborted);
+    });
+
+    // Start server in background (lifetime tied to process)
+    _ = app.RunAsync();
+    Console.WriteLine($"[Bridge] 内嵌桥接服务器已启动: ws://127.0.0.1:{port}");
+
+    // Brief delay to let Kestrel bind the port
+    await Task.Delay(500);
 }

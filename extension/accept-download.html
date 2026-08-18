@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script>
+const params = new URLSearchParams(location.search);
+const downloadId = parseInt(params.get('id'), 10);
+if (downloadId) {
+  chrome.downloads.acceptDanger(downloadId, () => {
+    chrome.downloads.resume(downloadId).catch(() => {});
+    setTimeout(() => window.close(), 500);
+  });
+} else {
+  window.close();
+}
+</script>
+</body>
+</html>

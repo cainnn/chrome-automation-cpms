@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using ChromeAutomation.Client;
+using ChromeAutomation.Import;
 
 namespace ChromeAutomation.CpmsExport;
 
@@ -14,6 +16,45 @@ internal static class CpmsWorkflow
     private static bool IsExcludedCpmsUrl(string url) =>
         url.Contains("attachmentDownload", StringComparison.OrdinalIgnoreCase) ||
         url.Contains("mops/tools", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 扩展激活标签页 + 聚焦 Chrome 窗口 + UIA 强制置前（用户可能在操作其他程序时必需）。
+    /// </summary>
+    public static async Task ActivateChromeForOperationAsync(
+        ChromeController chrome,
+        int? tabId,
+        string? windowTitleHint = null,
+        Action<string>? log = null)
+    {
+        void Log(string message) => log?.Invoke(message);
+
+        try
+        {
+            await chrome.CommandAsync("activateTab", new { tabId }, timeoutMs: 10000);
+            Log("[UIA] 扩展已激活标签页并聚焦窗口");
+        }
+        catch (Exception ex)
+        {
+            Log($"[UIA] 扩展激活标签页失败: {ex.Message}");
+        }
+
+        await Task.Delay(500);
+
+        try
+        {
+            var ok = await ChromeUiaHelper.ActivateCpmsChromeAsync(windowTitleHint);
+            if (ok)
+                Log("[UIA] Chrome 窗口已置于前台");
+            else
+                Log("[UIA] 未能将 CPMS Chrome 置于前台，继续尝试 UIA 操作");
+        }
+        catch (Exception uiaEx)
+        {
+            Log($"[UIA] 激活 Chrome 异常（继续）: {uiaEx.Message}");
+        }
+
+        await Task.Delay(600);
+    }
 
     public static async Task<bool> HasExportButtonAsync(ChromeController chrome, int? tabId = null)
     {
@@ -107,7 +148,7 @@ internal static class CpmsWorkflow
                 if (IsReportPageUrl(tabUrl) && await IsOnReportPageAsync(chrome, tabId))
                 {
                     Log($"[2/7] 找到已打开的报表页 (tab id={tabId})");
-                    await chrome.CommandAsync("activateTab", new { tabId });
+                    await ActivateChromeForOperationAsync(chrome, tabId, "计划建设", Log);
                     return tabId;
                 }
             }
@@ -128,7 +169,7 @@ internal static class CpmsWorkflow
         else
         {
             Log($"[2/7] 导航到报表页 (tab id={targetTabId})");
-            await chrome.CommandAsync("activateTab", new { tabId = targetTabId });
+            await ActivateChromeForOperationAsync(chrome, targetTabId, "计划建设", Log);
         }
 
         await chrome.NavigateAsync(reportUrl, waitUntil: "spa", tabId: targetTabId, recreateUrl: reportUrl);
@@ -189,6 +230,24 @@ internal static class CpmsWorkflow
         (body.Contains("登录", StringComparison.Ordinal) || body.Contains("用户名", StringComparison.Ordinal)) &&
         !body.Contains("项目明细", StringComparison.Ordinal);
 
+    public static async Task PrepareReportForExportAsync(
+        ChromeController chrome,
+        int? tabId,
+        Action<string>? log = null)
+    {
+        void Log(string message) => log?.Invoke(message);
+        Log("[3/7] 点击「查询」加载报表数据...");
+        try
+        {
+            await chrome.CommandAsync("clickByText", new { text = "查询", exact = true, tabId });
+            await ChromeAutomationHelpers.DelayAsync(6000);
+        }
+        catch
+        {
+            Log("[3/7] 未找到「查询」按钮，继续尝试导出");
+        }
+    }
+
     public static async Task ClickExportButtonAsync(
         ChromeController chrome,
         string reportUrl,
@@ -212,6 +271,7 @@ internal static class CpmsWorkflow
 
             try
             {
+                await ActivateChromeForOperationAsync(chrome, tabId, "计划建设", log);
                 var probe = await chrome.CommandAsync("cpmsHasExportButton", new { tabId });
                 if (probe?.TryGetProperty("found", out var found) == true && found.GetBoolean())
                 {
@@ -228,6 +288,19 @@ internal static class CpmsWorkflow
             {
                 await chrome.CommandAsync("clickByText", new { text = "导出", exact = true, tabId });
                 return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+
+            try
+            {
+                if (await ChromeUiaHelper.ClickExportButtonAsync())
+                {
+                    log?.Invoke("[3/7] UIA 已点击「导出」");
+                    return;
+                }
             }
             catch (Exception ex)
             {
@@ -264,6 +337,7 @@ internal static class CpmsWorkflow
             try
             {
                 await ChromeAutomationHelpers.DelayAsync(2000);
+                await PrepareReportForExportAsync(chrome, tabId, log);
                 await ClickExportButtonAsync(chrome, reportUrl, tabId, log);
                 var serial = await WaitAndConfirmExportDialogAsync(chrome, tabId);
                 return serial;
@@ -385,7 +459,7 @@ internal static class CpmsWorkflow
                 }
 
                 Log($"[4/7] 找到已有下载列表标签页 (tab id={existingId})");
-                await chrome.CommandAsync("activateTab", new { tabId = existingId });
+                await ActivateChromeForOperationAsync(chrome, existingId, "我的下载", Log);
                 if (await TryLoadDownloadListTableAsync(chrome, existingId, downloadListUrl, Log))
                 {
                     return existingId;
@@ -524,12 +598,15 @@ internal static class CpmsWorkflow
         ChromeController chrome,
         string? serialNumber,
         int? tabId = null,
+        Action<string>? log = null,
         int pollIntervalMs = 10000,
         int timeoutMs = 1800000)
     {
+        void Log(string msg) { Console.WriteLine(msg); log?.Invoke(msg); }
+
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         var label = serialNumber ?? "最新任务";
-        Console.WriteLine($"[5/7] 等待后台处理完成 ({label})...");
+        Log($"[5/7] 等待后台处理完成 ({label})...");
 
         while (DateTime.UtcNow < deadline)
         {
@@ -545,20 +622,20 @@ internal static class CpmsWorkflow
 
             if (status is null)
             {
-                Console.WriteLine("[5/7] 未找到任务行，刷新列表...");
+                Log("[5/7] 未找到任务行，刷新列表...");
             }
             else if (status.Processing)
             {
-                Console.WriteLine("[5/7] 状态: 正在后台下载...");
+                Log("[5/7] 状态: 正在后台下载...");
             }
             else if (status.Success)
             {
-                Console.WriteLine("[5/7] 状态: 后台下载成功，可以下载");
+                Log("[5/7] 状态: 后台下载成功，可以下载");
                 return;
             }
             else
             {
-                Console.WriteLine($"[5/7] 状态: {status.RawStatus}");
+                Log($"[5/7] 状态: {status.RawStatus}");
             }
 
             await RefreshExportTaskListAsync(chrome, tabId);
@@ -569,7 +646,7 @@ internal static class CpmsWorkflow
     }
 
     /// <summary>
-    /// 下载步骤：扩展 cpmsDownloadBySerial（被动解析 URL → blob 旁路），必要时轮询磁盘。
+    /// 下载步骤：UIA 真实点击「下载」+ UIA 点击「保留」，最多重试 2 次；失败后再走扩展兜底。
     /// </summary>
     public static async Task<string> CompleteDownloadStepAsync(
         ChromeController chrome,
@@ -577,83 +654,232 @@ internal static class CpmsWorkflow
         int? tabId,
         string downloadListUrl,
         DateTime downloadStartedAt,
+        Action<string>? log = null,
         int timeoutMs = 600000)
     {
-        Console.WriteLine("[6/7] 下载（被动解析 URL → blob 旁路，不触发 Chrome 危险下载提示）");
-        Console.WriteLine("[6/7] 详见 docs/download-troubleshooting.md");
+        void Log(string msg) { Console.WriteLine(msg); log?.Invoke(msg); }
 
         var downloadsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             "Downloads");
-        Console.WriteLine($"[6/7] 监控下载目录: {downloadsDir}");
+        Log($"[6/7] 监控下载目录: {downloadsDir}");
 
         var existing = FindRecentCpmsArchive(downloadsDir, downloadStartedAt);
         if (existing is not null && File.Exists(existing))
         {
-            Console.WriteLine($"[6/7] 下载文件已存在: {existing}");
+            Log($"[6/7] 下载文件已存在: {existing}");
             return existing;
+        }
+
+        var forceDownload = string.Equals(
+            Environment.GetEnvironmentVariable("CPMS_FORCE_DOWNLOAD"),
+            "1",
+            StringComparison.OrdinalIgnoreCase);
+
+        if (!forceDownload && !string.IsNullOrEmpty(serialNumber))
+        {
+            var priorZip = Directory.GetFiles(downloadsDir, $"*{serialNumber}*.zip", SearchOption.TopDirectoryOnly)
+                .Concat(Directory.GetFiles(downloadsDir, $"*{serialNumber}*.xlsx", SearchOption.AllDirectories))
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+            if (priorZip is not null && File.Exists(priorZip))
+            {
+                Log($"[6/7] 复用已有文件: {priorZip}");
+                return priorZip;
+            }
+        }
+        else if (forceDownload)
+        {
+            Log("[6/7] CPMS_FORCE_DOWNLOAD=1，跳过复用已有 ZIP");
         }
 
         await RefreshDownloadListAsync(chrome, tabId);
         await ChromeAutomationHelpers.DelayAsync(2000);
+        await ActivateChromeForOperationAsync(chrome, tabId, serialNumber, Log);
 
-        var maxAttempts = Math.Max(1, timeoutMs / 120000);
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        var sinceMs = new DateTimeOffset(downloadStartedAt).ToUnixTimeMilliseconds();
+
+        // ── 主路径: 仅点击一次「下载」，之后只轮询浮窗「保留」+ 等待落盘 ──
+        Log("[6/7] UIA 点击列表「下载」（仅一次）...");
+        var clicked = false;
+        try
         {
-            Console.WriteLine($"[6/7] cpmsDownloadBySerial (第 {attempt} 次)...");
-            JsonElement? result = null;
+            clicked = await ChromeUiaHelper.ClickDownloadButtonBySerialAsync(
+                serialNumber ?? "", timeoutMs: 30000);
+            if (clicked)
+                Log("[6/7] UIA 已点击「下载」");
+        }
+        catch (Exception clickEx)
+        {
+            Log($"[6/7] UIA 点击下载异常: {clickEx.Message}");
+        }
+
+        if (!clicked)
+        {
             try
             {
-                result = await chrome.CommandAsync(
-                    "cpmsDownloadBySerial",
+                await chrome.CommandAsync(
+                    "cpmsClickDownload",
                     new { serialNumber, tabId, recreateUrl = downloadListUrl });
+                Log("[6/7] 扩展已点击「下载」（兜底，仅一次）");
             }
-            catch (Exception ex)
+            catch (Exception extEx)
             {
-                CpmsDownloadDiagnostics.LogDownloadResult(null, ex);
+                Log($"[6/7] 扩展点击下载失败: {extEx.Message}");
             }
+        }
 
-            CpmsDownloadDiagnostics.LogDownloadResult(result);
+        var kept = false;
+        try
+        {
+            kept = await ChromeUiaHelper.ClickKeepInDownloadPanelAsync(
+                serialNumber ?? "", timeoutMs: 120000);
+            if (kept)
+                Log("[6/7] UIA 已在 Chrome 浮窗点击「保留」");
+        }
+        catch (Exception keepEx)
+        {
+            Log($"[6/7] UIA 保留异常: {keepEx.Message}");
+        }
 
-            if (result?.TryGetProperty("method", out var methodProp) == true)
+        try
+        {
+            var diskPath = await WaitForDownloadOnDiskAsync(
+                serialNumber ?? "", 180000, downloadStartedAt);
+            if (!string.IsNullOrEmpty(diskPath) && File.Exists(diskPath))
             {
-                var method = methodProp.GetString() ?? "";
-                if (method.StartsWith("blob-bypass", StringComparison.OrdinalIgnoreCase))
+                Log($"[6/7] UIA 下载成功: {diskPath}");
+                return diskPath;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (TimeoutException) { }
+
+        var quick = FindRecentCpmsArchive(downloadsDir, downloadStartedAt);
+        if (quick is not null && File.Exists(quick))
+        {
+            Log($"[6/7] 检测到下载文件: {quick}");
+            return quick;
+        }
+
+        if (!kept)
+        {
+            Log("[6/7] 未点击到「保留」，最后再轮询一次浮窗（不重复点下载）...");
+            try
+            {
+                if (await ChromeUiaHelper.ClickKeepInDownloadPanelAsync(serialNumber ?? "", timeoutMs: 60000))
                 {
-                    var path = ResolveDownloadedFilePath(result.Value, downloadsDir);
-                    if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                    Log("[6/7] UIA 已在 Chrome 浮窗点击「保留」");
+                    var diskPath = await WaitForDownloadOnDiskAsync(
+                        serialNumber ?? "", 120000, downloadStartedAt);
+                    if (!string.IsNullOrEmpty(diskPath) && File.Exists(diskPath))
                     {
-                        Console.WriteLine($"[6/7] 下载完成: {path}");
-                        return path;
+                        Log($"[6/7] UIA 下载成功: {diskPath}");
+                        return diskPath;
                     }
                 }
             }
-
-            try
+            catch (Exception keepEx)
             {
-                var diskPath = await WaitForDownloadOnDiskAsync(
-                    serialNumber ?? "",
-                    60000,
-                    downloadStartedAt);
-                if (!string.IsNullOrEmpty(diskPath) && File.Exists(diskPath))
+                Log($"[6/7] UIA 保留重试异常: {keepEx.Message}");
+            }
+
+            quick = FindRecentCpmsArchive(downloadsDir, downloadStartedAt);
+            if (quick is not null && File.Exists(quick))
+            {
+                Log($"[6/7] 检测到下载文件: {quick}");
+                return quick;
+            }
+        }
+
+        // ── 兜底: blob 旁路解除危险下载拦截 ──
+        Log("[6/7] UIA 主路径未成功，尝试 blob 旁路...");
+        try
+        {
+            var rescueResult = await chrome.CommandAsync(
+                "cpmsRescueDangerousDownload",
+                new { serialNumber, tabId, sinceMs },
+                timeoutMs: 120000);
+
+            if (rescueResult.HasValue)
+            {
+                Log($"[6/7] Rescue 结果: {rescueResult}");
+                if (rescueResult.Value.TryGetProperty("ok", out var okProp) && okProp.GetBoolean())
                 {
-                    Console.WriteLine($"[6/7] 磁盘检测到文件: {diskPath}");
-                    return diskPath;
+                    var rescuePath = ResolveDownloadedFilePath(rescueResult.Value, downloadsDir);
+                    if (!string.IsNullOrEmpty(rescuePath) && File.Exists(rescuePath))
+                    {
+                        Log($"[6/7] blob 旁路下载成功: {rescuePath}");
+                        return rescuePath;
+                    }
                 }
             }
-            catch (OperationCanceledException)
-            {
-                // 本轮磁盘等待超时
-            }
+        }
+        catch (Exception rescueEx)
+        {
+            Log($"[6/7] blob 旁路失败: {rescueEx.Message}");
+        }
 
-            await RefreshDownloadListAsync(chrome, tabId);
-            await Task.Delay(8000);
+        var afterRescue = FindRecentCpmsArchive(downloadsDir, downloadStartedAt);
+        if (afterRescue is not null && File.Exists(afterRescue))
+        {
+            Log($"[6/7] 下载完成: {afterRescue}");
+            return afterRescue;
+        }
+
+        // ── 兜底: HTTP 直连（Cookie）──
+        if (!string.IsNullOrEmpty(serialNumber))
+        {
+            Log("[6/7] 尝试 HTTP Cookie 直连下载...");
+            try
+            {
+                var httpPath = await CpmsHttpDownloader.TryDownloadBySerialAsync(
+                    serialNumber,
+                    downloadsDir,
+                    downloadStartedAt,
+                    chrome);
+                if (!string.IsNullOrEmpty(httpPath) && File.Exists(httpPath))
+                {
+                    Log($"[6/7] HTTP 下载成功: {httpPath}");
+                    return httpPath;
+                }
+            }
+            catch (Exception httpEx)
+            {
+                Log($"[6/7] HTTP 兜底失败: {httpEx.Message}");
+            }
         }
 
         throw new TimeoutException(
             string.IsNullOrEmpty(serialNumber)
                 ? "等待下载文件超时"
                 : $"等待下载文件超时，流水号: {serialNumber}");
+    }
+
+    /// <summary>
+    /// UIA 下载（含浮窗「保留」）→ 解压 Excel → 导入数据库。
+    /// </summary>
+    public static async Task<string> CompleteDownloadAndImportAsync(
+        ChromeController chrome,
+        string? serialNumber,
+        int? tabId,
+        string downloadListUrl,
+        DateTime downloadStartedAt,
+        Action<string>? log = null,
+        int timeoutMs = 600000)
+    {
+        void Log(string msg) { Console.WriteLine(msg); log?.Invoke(msg); }
+
+        var downloadedPath = await CompleteDownloadStepAsync(
+            chrome, serialNumber, tabId, downloadListUrl, downloadStartedAt, log, timeoutMs);
+
+        var excelPath = downloadedPath.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)
+            ? downloadedPath
+            : ResolveExcelPath(downloadedPath);
+        Log($"[6/7] Excel 路径: {excelPath}");
+
+        await RunDatabaseImportAsync(excelPath, log);
+        return excelPath;
     }
 
     private static string? ResolveDownloadedFilePath(JsonElement result, string downloadsDir)
@@ -950,52 +1176,22 @@ internal static class CpmsWorkflow
         throw new FileNotFoundException($"未找到 Excel 文件，下载路径: {downloadedPath}");
     }
 
-    public static async Task RunDatabaseImportAsync(string excelPath)
+    public static async Task RunDatabaseImportAsync(string excelPath, Action<string>? log = null)
     {
-        var netProjectDir = Environment.GetEnvironmentVariable("NET_IMPORT_PROJECT") ?? @"D:\NET";
-        if (!Directory.Exists(netProjectDir))
+        void Log(string msg) { Console.WriteLine(msg); log?.Invoke(msg); }
+
+        Log($"[7/7] Excel 文件: {excelPath}");
+
+        var result = await ImportRunner.RunAsync(
+            excelPath,
+            connectionString: Environment.GetEnvironmentVariable("NET_IMPORT_CONNECTION"),
+            asposeLicensePath: Environment.GetEnvironmentVariable("ASPOSE_LICENSE_PATH"),
+            log: Log);
+
+        if (result.HasError)
         {
-            throw new DirectoryNotFoundException($"导入项目不存在: {netProjectDir}");
+            throw new InvalidOperationException($"数据库导入失败: {result.ErrorMessage}");
         }
-
-        Console.WriteLine($"[7/7] 调用导入项目: {netProjectDir}");
-        Console.WriteLine($"[7/7] Excel 文件: {excelPath}");
-
-        var csproj = Path.Combine(netProjectDir, "PersonalPMS.ProjectReport.csproj");
-        if (!File.Exists(csproj))
-        {
-            csproj = netProjectDir;
-        }
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = "dotnet",
-            Arguments = $"run --project \"{csproj}\" -- --excel \"{excelPath}\"",
-            WorkingDirectory = netProjectDir,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-
-        using var process = Process.Start(psi)
-            ?? throw new InvalidOperationException("无法启动导入进程");
-
-        var stdout = await process.StandardOutput.ReadToEndAsync();
-        var stderr = await process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
-
-        Console.WriteLine(stdout);
-        if (!string.IsNullOrWhiteSpace(stderr))
-        {
-            Console.Error.WriteLine(stderr);
-        }
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException($"数据库导入失败，退出码: {process.ExitCode}");
-        }
-
-        Console.WriteLine("[7/7] 数据库导入完成");
     }
 }
 
